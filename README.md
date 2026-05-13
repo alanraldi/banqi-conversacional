@@ -23,12 +23,14 @@ Cliente faz biometria facial (selfie via link)
         ↓
 Cliente confirma o contrato
         ↓
-Agente acompanha e notifica: Assinado → CCB → Formalizado → Depositado 🎉
+Agente acompanha e notifica: Assinado → CCB → Formalizado → Depositado
 ```
 
 ---
 
 ## Arquitetura
+
+### Produção (AWS)
 
 ```
 WhatsApp → API Gateway + WAF → Lambda Handler
@@ -43,7 +45,23 @@ WhatsApp → API Gateway + WAF → Lambda Handler
             APIs banQi via AgentCore Gateway (MCP)
 ```
 
-**Stack principal:** Python · Strands Agents SDK · AWS Bedrock AgentCore · FastAPI (mock)
+### Desenvolvimento Local (sem ambiente AWS)
+
+```
+simulate_flow.py / curl
+        ↓
+src/local_server.py :8080   ←  substitui Lambda + API Gateway
+        ↓
+src/main.py (Strands Agents) ←  substitui AgentCore Runtime
+        ↓
+mock_api/server.py :8000    ←  substitui APIs reais banQi
+        ↓
+DynamoDB Local :8001         ←  substitui DynamoDB AWS
+
+        ↕ AWS Bedrock (única chamada externa — precisa de credenciais AWS)
+```
+
+**Stack principal:** Python 3.12 · Strands Agents SDK · AWS Bedrock · FastAPI · Docker
 
 ---
 
@@ -51,168 +69,185 @@ WhatsApp → API Gateway + WAF → Lambda Handler
 
 ```
 banqi-conversacional/
-├── README.md                   ← este arquivo
-├── projeto.md                  ← documentação completa do projeto
-├── Dockerfile                  ← imagem ARM64 para AgentCore Runtime
-├── pyproject.toml              ← dependências Python e configuração de ferramentas
-├── .env.example                ← variáveis de ambiente (copiar para .env)
+├── README.md                     ← este arquivo
+├── Dockerfile                    ← imagem ARM64 para AgentCore Runtime (produção)
+├── docker-compose.yml            ← ambiente local completo (mock + dynamo + agente)
+├── pyproject.toml                ← dependências Python e ferramentas
+├── .env.example                  ← variáveis de ambiente (copiar para .env)
 │
-├── infrastructure/             ← E1: Infraestrutura AWS (Terraform)
+├── infrastructure/               ← E1: Infraestrutura AWS (Terraform)
 │   └── terraform/
-│       ├── main.tf             ← orquestra os 7 módulos
-│       ├── variables.tf        ← todas as variáveis de entrada
-│       ├── outputs.tf          ← outputs exportados
-│       ├── providers.tf        ← provider AWS + backend S3
+│       ├── main.tf               ← orquestra os 7 módulos
+│       ├── variables.tf          ← todas as variáveis de entrada
+│       ├── outputs.tf            ← outputs exportados
+│       ├── providers.tf          ← provider AWS + backend S3
 │       ├── terraform.tfvars.example
 │       └── modules/
-│           ├── network/        ← VPC, subnets, 7 VPC Endpoints, WAF
-│           ├── iam/            ← roles para Runtime, Lambda e Gateway
-│           ├── runtime/        ← AgentCore Runtime (container ARM64)
-│           ├── memory/         ← AgentCore Memory (STM + LTM)
-│           ├── gateway/        ← AgentCore Gateway MCP (8 targets banQi)
-│           ├── guardrails/     ← Bedrock Guardrails (prompt injection / jailbreak)
-│           └── whatsapp/       ← Lambda + API GW + DynamoDB dedup + WAF
+│           ├── network/          ← VPC, subnets, 7 VPC Endpoints, WAF
+│           ├── iam/              ← roles para Runtime, Lambda e Gateway
+│           ├── runtime/          ← AgentCore Runtime (container ARM64)
+│           ├── memory/           ← AgentCore Memory (STM + LTM)
+│           ├── gateway/          ← AgentCore Gateway MCP (8 targets banQi)
+│           ├── guardrails/       ← Bedrock Guardrails (prompt injection / jailbreak)
+│           └── whatsapp/         ← Lambda + API GW + DynamoDB dedup + WAF
 │
-├── domains/                    ← E2: Configuração de domínio
+├── domains/                      ← E2: Configuração de domínio
 │   └── consignado/
-│       ├── domain.yaml         ← config: agentes, modelos, memória, mensagens
+│       ├── domain.yaml           ← config: agentes, modelos, memória, mensagens
 │       └── prompts/
-│           ├── supervisor.md   ← prompt do Supervisor (routing + delegação)
-│           ├── consignado.md   ← prompt do Consignado Agent (etapas 1-7)
-│           └── general.md      ← prompt do General Agent (fora do escopo)
+│           ├── supervisor.md     ← prompt do Supervisor (routing + delegação)
+│           ├── consignado.md     ← prompt do Consignado Agent (etapas 1-7)
+│           └── general.md        ← prompt do General Agent (fora do escopo)
 │
-├── src/                        ← E2/E3/E4: Código Python da aplicação
-│   ├── main.py                 ← entrypoint do AgentCore Runtime
+├── src/                          ← E2/E3/E4: Código Python da aplicação
+│   ├── main.py                   ← entrypoint do AgentCore Runtime
+│   ├── local_server.py           ← servidor FastAPI para testes locais
 │   ├── agents/
-│   │   ├── factory.py          ← cria Supervisor + sub-agentes (Agents-as-Tools)
-│   │   └── context.py          ← SessionContext thread-local
-│   ├── tools/                  ← E3: 8 tools MCP (chamadas às APIs banQi)
-│   │   ├── consent_term.py     ← etapas 1-2: criar e aceitar termo
-│   │   ├── simulation.py       ← etapa 3: criar simulação e buscar fallback
-│   │   ├── proposal.py         ← etapas 4 e 6: criar proposta e aceite formal
-│   │   └── biometry.py         ← etapa 5: iniciar e continuar biometria
-│   ├── webhook/                ← E4: Handler de webhooks
-│   │   ├── handler.py          ← Lambda entrypoint (WhatsApp + banQi)
-│   │   ├── router.py           ← roteador de eventos banQi → handler
-│   │   ├── events.py           ← handlers para cada tipo de evento
-│   │   ├── session.py          ← correlação de sessão por telefone
-│   │   ├── models.py           ← modelos Pydantic dos payloads
-│   │   ├── signature.py        ← validação HMAC-SHA256 timing-safe
-│   │   ├── whatsapp_client.py  ← cliente HTTP WhatsApp Business API
-│   │   └── agentcore_client.py ← invoke AgentCore + save memory
+│   │   ├── factory.py            ← cria Supervisor + sub-agentes (Agents-as-Tools)
+│   │   └── context.py            ← SessionContext thread-local
+│   ├── tools/                    ← E3: 8 tools MCP (chamadas às APIs banQi)
+│   │   ├── consent_term.py       ← etapas 1-2: criar e aceitar termo
+│   │   ├── simulation.py         ← etapa 3: criar simulação e buscar fallback
+│   │   ├── proposal.py           ← etapas 4 e 6: criar proposta e aceite formal
+│   │   └── biometry.py           ← etapa 5: iniciar e continuar biometria
+│   ├── webhook/                  ← E4: Handler de webhooks
+│   │   ├── handler.py            ← Lambda entrypoint (WhatsApp + banQi)
+│   │   ├── router.py             ← roteador de eventos banQi → handler
+│   │   ├── events.py             ← handlers para cada tipo de evento
+│   │   ├── session.py            ← correlação de sessão por telefone
+│   │   ├── models.py             ← modelos Pydantic dos payloads
+│   │   ├── signature.py          ← validação HMAC-SHA256 timing-safe
+│   │   ├── whatsapp_client.py    ← cliente HTTP WhatsApp Business API
+│   │   └── agentcore_client.py   ← invoke AgentCore + save memory
 │   ├── config/
-│   │   └── settings.py         ← Settings (pydantic-settings, dual env/Secrets Manager)
+│   │   └── settings.py           ← Settings (pydantic-settings, dual env/Secrets Manager)
 │   └── utils/
-│       ├── pii.py              ← PII masking nos logs (LGPD)
-│       ├── validation.py       ← validadores de CPF, e-mail, CEP etc.
-│       ├── logging.py          ← configuração de logging estruturado
-│       └── secrets.py          ← carregamento de secrets (dev: env / prod: Secrets Manager)
+│       ├── pii.py                ← PII masking nos logs (LGPD)
+│       ├── validation.py         ← validadores de CPF, e-mail, CEP etc.
+│       ├── logging.py            ← configuração de logging estruturado
+│       └── secrets.py            ← carregamento de secrets (dev: env / prod: Secrets Manager)
 │
-├── api/                        ← contratos OpenAPI das APIs banQi
-├── specs/                      ← especificações técnicas e fluxo conversacional
-├── mock_api/                   ← servidor mock para desenvolvimento e testes
-└── fluxo_trabalho/             ← PDFs com os diagramas de fluxo das etapas
+├── mock_api/                     ← Servidor mock das APIs banQi
+│   ├── server.py                 ← FastAPI com 8 endpoints + 6 webhooks simulados
+│   ├── test_flow.py              ← 40 testes automatizados (4 cenários)
+│   ├── Dockerfile                ← containeriza o mock para docker-compose
+│   └── requirements.txt          ← fastapi, uvicorn, httpx
+│
+├── scripts/
+│   └── simulate_flow.py          ← simula fluxo completo etapas 1-7 sem WhatsApp
+│
+├── api/                          ← contratos OpenAPI das APIs banQi
+├── specs/                        ← especificações técnicas e fluxo conversacional
+├── cod_poc/                      ← código de referência da PoC (CI&T)
+├── fluxo_trabalho/               ← PDFs com diagramas das 7 etapas
+└── arquitetura/                  ← diagramas arquiteturais
 ```
 
 ---
 
-## Pastas em Detalhe
+## Pré-requisitos
 
-### `projeto.md`
+| Ferramenta | Versão | Para quê |
+|---|---|---|
+| Python | 3.12+ | Executar o agente e os testes |
+| Docker + Docker Compose | 24+ | Ambiente local completo |
+| AWS CLI | 2+ | Credenciais para o Bedrock |
+| Terraform | 1.7+ | Provisionamento AWS (produção) |
+| uv | qualquer | Gerenciador de pacotes Python |
 
-Documento central do projeto na visão de PO. Contém:
-
-- Visão do produto, escopo do MVP e público-alvo
-- Arquitetura completa com diagramas
-- Fluxo conversacional das 7 etapas
-- **5 épicos e 22 histórias de usuário** com critérios de aceite
-- Especificações técnicas (payloads, validações, tratamento de erros)
-- Guia de provisionamento de serviços AWS (Terraform, 8 módulos, 36 recursos)
-- Estratégia do mock e de desenvolvimento
-- Segurança e conformidade LGPD
-- Estimativa e roadmap (~8 semanas)
+> **Conta AWS com acesso ao Bedrock é o único requisito de nuvem para desenvolvimento local.**
+> Todos os demais serviços rodam via Docker.
 
 ---
 
-### `api/`
+## Configuração Local (Passo a Passo)
 
-Contratos OpenAPI (YAML) das APIs banQi que o agente consome.
-
-| Arquivo | Conteúdo |
-|---|---|
-| `openapi-wpp-etapas-1-2-3-4.yaml` | Termo de consentimento, aceite, simulação e proposta |
-| `openapi-wpp-etapas-5-6-7.yaml` | Biometria, aceite formal e acompanhamento de status |
-
-Use esses arquivos para entender os payloads, códigos de retorno e webhooks de cada etapa antes de implementar as tools do agente.
-
----
-
-### `specs/`
-
-Especificações técnicas do projeto organizadas em subpastas.
-
-```
-specs/banQi_conversacional/
-├── spec.md          ← arquitetura dos agentes, tools e webhooks
-├── tasks.md         ← 41 tasks em 5 fases de desenvolvimento
-└── pipeline/
-    └── po-brief.md  ← fluxo conversacional turno a turno (cliente × agente × API)
-```
-
-**`spec.md`** — Referência técnica completa:
-- Hierarquia de agentes (Supervisor → Consignado Agent → General Agent)
-- Regra de delegação com contexto completo (sub-agentes são stateless)
-- Namespace de memória LTM com os 13 campos persistidos entre sessões
-- Assinatura das 8 tools MCP que chamam as APIs banQi
-- Tabela de roteamento de webhooks e mensagens por status
-- Validações de campos, prompts e regras de segurança
-
-**`tasks.md`** — Backlog de 41 tasks divididas em 5 fases:
-- Fase 0: Infraestrutura AWS (T-01 a T-09)
-- Fase 1: Estrutura dos agentes (T-10 a T-16)
-- Fase 2: Tools / integração APIs (T-17 a T-24)
-- Fase 3: Webhook handler (T-25 a T-28)
-- Fase 4: Testes end-to-end (T-29 a T-33)
-- Fase 5: Qualidade e produção (T-34 a T-41)
-
-**`po-brief.md`** — Roteiro turno a turno do que o agente fala, o que o cliente responde, qual API é chamada e qual webhook é esperado em cada momento do fluxo.
-
----
-
-### `mock_api/`
-
-Servidor local que simula todas as APIs banQi para desenvolvimento e testes sem depender do ambiente real.
-
-```
-mock_api/
-├── server.py          ← servidor FastAPI com os 8 endpoints simulados
-├── test_flow.py       ← script de testes com 4 cenários (40/40 passando)
-└── requirements.txt   ← dependências: fastapi, uvicorn, httpx
-```
-
-**Como iniciar o mock:**
+### 1. Clonar e instalar dependências
 
 ```powershell
+git clone https://github.com/alanraldi/banqi-conversacional.git
+cd banqi-conversacional
+
+# Instalar dependências (incluindo dev)
+uv pip install -e ".[dev]"
+```
+
+### 2. Configurar variáveis de ambiente
+
+```powershell
+copy .env.example .env
+```
+
+Editar o `.env` com os valores mínimos para rodar localmente:
+
+```env
+# Obrigatório — perfil AWS com acesso ao Bedrock
+APP_ENV=dev
+AWS_REGION=us-east-1
+AWS_PROFILE=seu-perfil-aws
+
+# Modelos Claude (valores padrão já funcionam)
+SUPERVISOR_AGENT_MODEL_ID=us.anthropic.claude-sonnet-4-6-20250514-v1:0
+CONSIGNADO_AGENT_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+GENERAL_AGENT_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+# Mock local (docker-compose define automaticamente)
+BANQI_API_BASE_URL=http://localhost:8000
+DEDUP_TABLE_NAME=banqi-dedup
+SESSION_TABLE_NAME=banqi-sessions
+```
+
+> Os demais campos (AgentCore, Gateway, WhatsApp) ficam vazios em dev.
+> O agente entra em **modo degradado** e funciona sem memória persistente.
+
+### 3. Verificar credenciais AWS
+
+```powershell
+aws sts get-caller-identity --profile seu-perfil-aws
+```
+
+Confirmar que o perfil tem acesso ao Bedrock:
+
+```powershell
+aws bedrock list-foundation-models --region us-east-1 --profile seu-perfil-aws
+```
+
+---
+
+## Como Testar Localmente
+
+Há três formas de testar, da mais simples para a mais completa:
+
+---
+
+### Opção A — Só o Mock (sem agente, sem AWS)
+
+Testa as APIs banQi simuladas de forma isolada. Não precisa de credenciais AWS.
+
+```powershell
+# Instalar dependências do mock
 pip install -r mock_api/requirements.txt
+
+# Iniciar o servidor mock
 python -m uvicorn mock_api.server:app --port 8000 --reload
 ```
 
-Documentação interativa disponível em: **http://localhost:8000/docs**
-
-**Como rodar os testes:**
+Documentação interativa: **http://localhost:8000/docs**
 
 ```powershell
+# Rodar os 40 testes automatizados
 python -X utf8 mock_api/test_flow.py
 ```
 
 **Cenários cobertos:**
 
-| Cenário | Checks |
+| Cenário | Testes |
 |---|---|
-| Fluxo completo (Etapas 1–7, do termo ao DISBURSED) | 30 ✅ |
-| Cliente sem elegibilidade (ELIGIBILITY_REJECTED) | 4 ✅ |
-| Biometria reprovada (DENIED) | 3 ✅ |
-| Erros síncronos (409, 412) | 3 ✅ |
+| Fluxo completo (etapas 1-7, do termo ao DISBURSED) | 30 |
+| Cliente sem elegibilidade (ELIGIBILITY_REJECTED) | 4 |
+| Biometria reprovada (DENIED) | 3 |
+| Erros síncronos (409, 412) | 3 |
+| **Total** | **40** |
 
 **Padrões especiais para simular erros:**
 
@@ -224,26 +259,157 @@ python -X utf8 mock_api/test_flow.py
 | Chamar `/consent-term/accept` duas vezes | Erro 409 (já aceito) |
 | `idSimulation` inexistente na proposta | Erro 412 (simulação inválida) |
 
-**Verificar webhooks recebidos:**
-```
-GET http://localhost:8000/test/webhooks/+5511999990001
+---
+
+### Opção B — Ambiente completo via Docker Compose
+
+Sobe mock + DynamoDB Local + agente. Testa o sistema inteiro com Claude real.
+
+```powershell
+# Subir todo o ambiente local
+docker-compose up
+
+# Aguardar todos os serviços ficarem healthy (30-60 segundos)
+# mock-api:   http://localhost:8000/docs
+# dynamodb:   http://localhost:8001/shell
+# agent:      http://localhost:8080/ping
 ```
 
-**Resetar estado de um usuário:**
-```
-DELETE http://localhost:8000/test/state/+5511999990001
+**Serviços iniciados:**
+
+| Serviço | Porta | O que faz |
+|---|---|---|
+| `mock-api` | 8000 | Simula todas as APIs banQi + webhooks |
+| `dynamodb` | 8001 | DynamoDB Local (dedup + sessões) |
+| `dynamodb-setup` | — | Cria as tabelas automaticamente (roda e sai) |
+| `agent` | 8080 | Agente local com Claude real via Bedrock |
+
+```powershell
+# Testar se o agente está respondendo
+curl http://localhost:8080/ping
+# Resposta esperada: {"status": "ok", "env": "dev"}
 ```
 
 ---
 
-### `fluxo_trabalho/`
+### Opção C — Simulação do fluxo completo
 
-PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, fornecidos pela equipe banQi como referência para o desenvolvimento.
+Simula uma conversa real de ponta a ponta (etapas 1-7) sem precisar de WhatsApp.
 
-| Arquivo | Etapas |
-|---|---|
-| `fluxo-etapas-1-2-3-4-consignado-whatsapp.pdf` | Termo, aceite, simulação e proposta |
-| `fluxo-etapas-5-6-7-consignado-whatsapp.pdf` | Biometria, aceite formal e status |
+```powershell
+# Com o docker-compose rodando em outro terminal:
+python scripts/simulate_flow.py
+```
+
+O script executa automaticamente:
+1. Cliente manda "Oi" e inicia a conversa
+2. Envia CPF e nome
+3. Dispara webhook `CONSENT_TERM_FILE_READY`
+4. Cliente aceita o termo
+5. Dispara webhook `SIMULATION_READY` com oferta
+6. Cliente aceita a simulação e envia e-mail
+7. Dispara webhook `PROPOSAL_CREATED`
+8. Dispara webhooks de status: `SIGNED` → `CCB_GENERATED` → `DISBURSED`
+
+**Você verá os logs do agente no terminal do docker-compose.**
+
+---
+
+### Opção D — Testes unitários
+
+Testa validações, PII masking, roteamento e handlers sem AWS.
+
+```powershell
+# Rodar todos os testes unitários
+pytest tests/ -v
+
+# Só testes de uma pasta específica
+pytest tests/unit/ -v
+
+# Com cobertura
+pytest tests/ --cov=src --cov-report=term-missing
+```
+
+---
+
+## Testar Endpoints Manualmente
+
+Com o `docker-compose up` rodando, use os exemplos abaixo:
+
+### Simular mensagem WhatsApp recebida
+
+```powershell
+curl -X POST http://localhost:8080/whatsapp `
+  -H "Content-Type: application/json" `
+  -H "X-Hub-Signature-256: sha256=fake" `
+  -d '{
+    "object": "whatsapp_business_account",
+    "entry": [{
+      "id": "123",
+      "changes": [{
+        "value": {
+          "messaging_product": "whatsapp",
+          "messages": [{
+            "id": "msg_001",
+            "from": "+5511999990001",
+            "type": "text",
+            "text": {"body": "Oi, quero simular um emprestimo consignado"},
+            "timestamp": "1234567890"
+          }]
+        },
+        "field": "messages"
+      }]
+    }]
+  }'
+```
+
+### Simular webhook banQi recebido
+
+```powershell
+curl -X POST http://localhost:8080/webhook/banqi `
+  -H "Content-Type: application/json" `
+  -d '{
+    "event": "SIMULATION_READY",
+    "phone": "+5511999990001",
+    "data": {
+      "simulations": [{
+        "amount": 5000.00,
+        "numInstallments": 24,
+        "installmentAmount": 245.50,
+        "monthlyRate": 1.89,
+        "disbursementDate": "2026-05-20"
+      }]
+    }
+  }'
+```
+
+### Verificar webhooks recebidos pelo mock
+
+```powershell
+curl http://localhost:8000/test/webhooks/+5511999990001
+```
+
+### Resetar estado do usuário no mock
+
+```powershell
+curl -X DELETE http://localhost:8000/test/state/+5511999990001
+```
+
+---
+
+## Mapeamento: AWS (Produção) vs Local (Desenvolvimento)
+
+| Componente AWS | Substituto Local | Observação |
+|---|---|---|
+| AgentCore Runtime | `src/main.py` direto | Strands Agents roda local |
+| AgentCore Memory | Desabilitado (modo degradado) | Sem persistência entre sessões |
+| AgentCore Gateway (MCP) | Mock API `:8000` | `BANQI_API_BASE_URL=localhost:8000` |
+| Lambda Handler | `src/local_server.py` `:8080` | FastAPI simula o Lambda |
+| DynamoDB (dedup + sessão) | DynamoDB Local `:8001` | Imagem oficial AWS |
+| API Gateway + WAF | FastAPI direto | Sem rate limiting local |
+| Secrets Manager | Arquivo `.env` | `APP_ENV=dev` |
+| WhatsApp Business API | `curl` / `simulate_flow.py` | Mensagens simuladas |
+| Bedrock (Claude) | **AWS real** | Único serviço de nuvem obrigatório |
 
 ---
 
@@ -261,11 +427,51 @@ PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, forn
 
 ---
 
-## Backlog Consolidado — Épicos e Histórias
+## Deploy em Produção (quando ambiente banQi estiver disponível)
 
-> Detalhamento completo com 105 tasks e dependências em [`backlog.md`](backlog.md)
+### 1. Infraestrutura AWS (Terraform)
+
+```powershell
+cd infrastructure/terraform
+
+# Copiar e preencher variáveis
+copy terraform.tfvars.example terraform.tfvars
+
+# Inicializar com backend S3
+terraform init -backend-config=backend.tfvars
+
+# Revisar o que será criado
+terraform plan -var-file=terraform.tfvars
+
+# Aplicar (cria VPC, AgentCore, Lambda, DynamoDB, etc.)
+terraform apply -var-file=terraform.tfvars
+```
+
+### 2. Build e push do container
+
+```powershell
+# Build ARM64 para AgentCore (Graviton)
+docker buildx build --platform linux/arm64 -t banqi-conversacional:latest .
+
+# Tag e push para ECR (ARN do ECR gerado pelo Terraform)
+docker tag banqi-conversacional:latest <ecr-uri>:latest
+docker push <ecr-uri>:latest
+```
+
+### 3. Apontar o agente para as APIs reais
+
+Atualizar `.env` ou variáveis de ambiente do AgentCore Runtime:
+
+```env
+APP_ENV=prod
+BANQI_API_BASE_URL=https://api.banqi.com.br
+AGENTCORE_MEMORY_ID=<id gerado pelo terraform>
+AGENTCORE_GATEWAY_ENDPOINT=<url gerada pelo terraform>
+```
 
 ---
+
+## Backlog — Épicos e Histórias
 
 ### E1 — Infraestrutura e Setup AWS
 *Critério de aceite: Lambda recebe webhook do WhatsApp sem erro. AgentCore status ACTIVE.*
@@ -273,70 +479,62 @@ PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, forn
 | História | O que entrega | Tasks |
 |---|---|---|
 | H-01 Conta AWS e Networking | VPC privada, subnets em 2 AZs, 7 VPC Endpoints PrivateLink, Security Groups | T-01 a T-04 |
-| H-02 Repositório de Container | ECR com scan automático, Dockerfile ARM64, build via CodeBuild sem Docker local | T-05 a T-07 |
-| H-03 AgentCore Runtime | Runtime provisionado via Terraform, variáveis de ambiente, health check `/ping` validado | T-08 a T-10 |
-| H-04 AgentCore Memory | Memory store criado, namespace `users/{phone}/consignado` configurado, estratégias LTM ativas | T-11 a T-13 |
-| H-05 AgentCore Gateway | Cognito OAuth, 8 targets MCP apontando para APIs banQi, autenticação validada | T-14 a T-16 |
-| H-06 Lambda WhatsApp | Lambda + API Gateway + DynamoDB dedup (TTL 120s) + WAF (1.000 req/5min) + Meta webhook | T-17 a T-20 |
-| H-07 Bedrock Guardrails | Prompt attack detection HIGH, topic policy DENY fora do escopo consignado | T-21 a T-22 |
-| H-08 Secrets Manager | Secret JSON com credenciais WhatsApp, carregamento dual env var (dev) / Secrets Manager (prod) | T-23 a T-24 |
-
----
+| H-02 Repositório de Container | ECR com scan automático, Dockerfile ARM64, build via CodeBuild | T-05 a T-07 |
+| H-03 AgentCore Runtime | Runtime provisionado via Terraform, variáveis de ambiente, health check `/ping` | T-08 a T-10 |
+| H-04 AgentCore Memory | Memory store criado, namespace `users/{phone}/consignado`, estratégias LTM | T-11 a T-13 |
+| H-05 AgentCore Gateway | Cognito OAuth, 8 targets MCP apontando para APIs banQi | T-14 a T-16 |
+| H-06 Lambda WhatsApp | Lambda + API Gateway + DynamoDB dedup (TTL 120s) + WAF (1.000 req/5min) | T-17 a T-20 |
+| H-07 Bedrock Guardrails | Prompt attack detection HIGH, topic policy DENY fora do escopo | T-21 a T-22 |
+| H-08 Secrets Manager | Secret JSON com credenciais WhatsApp, carregamento dual env/Secrets Manager | T-23 a T-24 |
 
 ### E2 — Estrutura dos Agentes
-*Critério de aceite: Conversa básica funciona no Chainlit local. Routing correto em 10 mensagens de teste.*
+*Critério de aceite: Conversa básica funciona localmente. Routing correto em 10 mensagens de teste.*
 
 | História | O que entrega | Tasks |
 |---|---|---|
-| H-09 domain.yaml | Arquivo de configuração do domínio com agent_name, model IDs, prompts e namespaces de memória | T-25 a T-26 |
-| H-10 Supervisor Agent | Routing por intenção, recuperação LTM, injeção de contexto completo na delegação, retomada por `current_step` | T-27 a T-30 |
-| H-11 Consignado Agent | Controle de etapas (1–7), coleta progressiva (1 campo/mensagem), validações, mascaramento PII no chat | T-31 a T-34 |
-| H-12 General Agent | Mensagem padrão de fora do escopo, log de intenção para análise futura | T-35 |
-| H-13 Prompts | `supervisor.md` com routing e delegação, `consignado.md` com tom, etapas e tratamento de erros | T-36 a T-37 |
-| H-14 Memória e Persistência | STM sliding window, LTM tools `memory_read/write`, `save_conversation_to_memory()` no Lambda | T-38 a T-40 |
-
----
+| H-09 domain.yaml | Config do domínio: agent_name, model IDs, prompts e namespaces de memória | T-25 a T-26 |
+| H-10 Supervisor Agent | Routing por intenção, recuperação LTM, injeção de contexto, retomada por `current_step` | T-27 a T-30 |
+| H-11 Consignado Agent | Controle de etapas (1-7), coleta progressiva, validações, mascaramento PII | T-31 a T-34 |
+| H-12 General Agent | Mensagem padrão de fora do escopo, log de intenção | T-35 |
+| H-13 Prompts | `supervisor.md`, `consignado.md`, `general.md` | T-36 a T-37 |
+| H-14 Memória e Persistência | STM sliding window, LTM tools `memory_read/write` | T-38 a T-40 |
 
 ### E3 — Integração com APIs banQi (Tools MCP)
 *Critério de aceite: Cada tool retorna resposta esperada contra sandbox banQi.*
 
 | História | O que entrega | Tasks |
 |---|---|---|
-| H-15 create_consent_term | POST /consent-term, trata 406/409, aguarda webhook `CONSENT_TERM_FILE_READY` e envia PDF | T-41 a T-44 |
-| H-16 accept_consent_term | POST /consent-term/accept, captura IP/user-agent automático, roteia `SIMULATION_READY` ou `NO_OFFER_AVAILABLE` | T-45 a T-47 |
-| H-17 create_simulation | POST /simulations, cache hit (200 imediato) vs cache miss (202 + webhook), trata TOKEN_EXPIRED | T-48 a T-51 |
-| H-18 get_simulations | GET /simulations como fallback quando webhook `SIMULATION_COMPLETED` é perdido | T-52 |
-| H-19 create_proposal | POST /proposals, monta payload completo, aguarda `PROPOSAL_CREATED`, trata 412/422 | T-53 a T-56 |
-| H-20 start_biometry | POST /biometry, formata e envia BioLink ao cliente via WhatsApp | T-57 a T-58 |
-| H-21 continue_biometry | POST /biometry/continue, trata APPROVED/BIOMETRICS/DENIED, retry automático em BIOMETRICS | T-59 a T-61 |
-| H-22 accept_proposal | POST /accept com headers extras `x-remote-address` e `user-agent` | T-62 a T-63 |
-
----
+| H-15 create_consent_term | POST /consent-term, trata 406/409, aguarda `CONSENT_TERM_FILE_READY` | T-41 a T-44 |
+| H-16 accept_consent_term | POST /consent-term/accept, roteia `SIMULATION_READY` ou `NO_OFFER_AVAILABLE` | T-45 a T-47 |
+| H-17 create_simulation | POST /simulations, cache hit vs miss, trata TOKEN_EXPIRED | T-48 a T-51 |
+| H-18 get_simulations | GET /simulations como fallback quando webhook é perdido | T-52 |
+| H-19 create_proposal | POST /proposals, monta payload completo, aguarda `PROPOSAL_CREATED` | T-53 a T-56 |
+| H-20 start_biometry | POST /biometry, formata e envia BioLink ao cliente | T-57 a T-58 |
+| H-21 continue_biometry | POST /biometry/continue, trata APPROVED/BIOMETRICS/DENIED | T-59 a T-61 |
+| H-22 accept_proposal | POST /accept com headers `x-remote-address` e `user-agent` | T-62 a T-63 |
 
 ### E4 — Handler de Webhooks
-*Critério de aceite: Todos os 6 tipos de evento processados corretamente em testes de integração.*
+*Critério de aceite: Todos os 6 tipos de evento processados corretamente.*
 
 | História | O que entrega | Tasks |
 |---|---|---|
-| H-23 Roteamento de Eventos | Switch por tipo de evento: handlers para `CONSENT_TERM_FILE_READY`, `NO_OFFER_AVAILABLE`, `SIMULATION_READY`, `SIMULATION_COMPLETED`, `PROPOSAL_CREATED`, `PROPOSAL_STATUS_UPDATE` | T-64 a T-70 |
-| H-24 Correlação de Sessão | Lookup de sessão ativa por `phone`, log auditável de eventos órfãos com PII mascarado | T-71 a T-72 |
-| H-25 Sessão Expirada | HTTP 200 para webhooks sem sessão (evita retry desnecessário), fila de eventos pendentes para reconexão | T-73 a T-74 |
-| H-26 Retry e DLQ | SQS DLQ, 3 tentativas com backoff exponencial, alarme CloudWatch para DLQ acumulando | T-75 a T-77 |
-
----
+| H-23 Roteamento de Eventos | Switch por tipo: 6 handlers de eventos banQi | T-64 a T-70 |
+| H-24 Correlação de Sessão | Lookup de sessão por `phone`, log de eventos órfãos | T-71 a T-72 |
+| H-25 Sessão Expirada | HTTP 200 para webhooks sem sessão (evita retry) | T-73 a T-74 |
+| H-26 Retry e DLQ | SQS DLQ, 3 tentativas com backoff, alarme CloudWatch | T-75 a T-77 |
 
 ### E5 — Qualidade e Produção
 *Critério de aceite: P95 < 5s. Zero PII em logs. Pipeline CI/CD automático.*
 
 | História | O que entrega | Tasks |
 |---|---|---|
-| H-27 Testes Unitários | CPF, campos, PII masking, routing (10 in-scope + 10 out-of-scope), retomada por current_step | T-78 a T-82 |
-| H-28 Testes de Integração | 8 tools contra sandbox (happy path + erro), pipeline de webhook E2E | T-83 a T-85 |
-| H-29 Testes End-to-End | 7 cenários: fluxo completo, retomada, ELIGIBILITY_REJECTED, DENIED, TOKEN_EXPIRED, deduplicação, WhatsApp real | T-86 a T-92 |
-| H-30 CI/CD | GitHub Actions (pytest + ruff + Trivy), pipeline de deploy staging (build ARM64 → ECR → agentcore launch) | T-93 a T-95 |
-| H-31 Monitoramento | Dashboard CloudWatch (latência P95, erros, conversas, conversão), alarmes com SNS | T-96 a T-97 |
-| H-32 Carga e Segurança | 1.000 conversas simultâneas (Locust), prompt injection, jailbreak, fuzz, auditoria PII em logs | T-98 a T-102 |
-| H-33 Documentação | Runbook operacional, script LGPD `delete_user_data.py`, handover para o time banQi | T-103 a T-105 |
+| H-27 Testes Unitários | CPF, campos, PII masking, routing, retomada por current_step | T-78 a T-82 |
+| H-28 Testes de Integração | 8 tools contra sandbox, pipeline de webhook E2E | T-83 a T-85 |
+| H-29 Testes End-to-End | 7 cenários: fluxo completo, retomada, erros, WhatsApp real | T-86 a T-92 |
+| H-30 CI/CD | GitHub Actions (pytest + ruff + Trivy), deploy staging automático | T-93 a T-95 |
+| H-31 Monitoramento | Dashboard CloudWatch (latência P95, erros, conversão), alarmes SNS | T-96 a T-97 |
+| H-32 Carga e Segurança | 1.000 conversas simultâneas (Locust), prompt injection, auditoria PII | T-98 a T-102 |
+| H-33 Documentação | Runbook operacional, script LGPD `delete_user_data.py`, handover | T-103 a T-105 |
 
 ---
 
@@ -353,73 +551,33 @@ PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, forn
 
 ---
 
-## Como Desenvolver
-
-### Pré-requisitos
-
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) (gerenciador de pacotes)
-- AWS CLI configurado com perfil `banqi-dev`
-- Terraform 1.7+
-
-### Setup local
-
-```powershell
-# 1. Instalar dependências
-uv pip install -e ".[dev]"
-
-# 2. Configurar variáveis de ambiente
-copy .env.example .env
-# editar .env com os valores do ambiente de dev
-
-# 3. Iniciar mock da API banQi (sem precisar do ambiente real)
-pip install -r mock_api/requirements.txt
-python -m uvicorn mock_api.server:app --port 8000 --reload
-
-# 4. Rodar testes do mock (40/40)
-python -X utf8 mock_api/test_flow.py
-```
-
-### Deploy da infraestrutura (E1)
-
-```powershell
-cd infrastructure/terraform
-
-# Inicializar (com backend S3 configurado)
-terraform init -backend-config=backend.tfvars
-
-# Planejar
-terraform plan -var-file=terraform.tfvars
-
-# Aplicar
-terraform apply -var-file=terraform.tfvars
-```
-
-### Build e deploy do container (E2)
-
-```powershell
-# Build local para teste
-docker build -t banqi-conversacional:local .
-
-# Build ARM64 para AgentCore (via CI/CD — ver .github/workflows/)
-docker buildx build --platform linux/arm64 -t banqi-conversacional:latest .
-```
-
----
-
 ## Status Atual
 
-- [x] Especificação da arquitetura (`specs/spec.md`)
-- [x] Fluxo conversacional turno a turno (`specs/pipeline/po-brief.md`)
-- [x] Backlog detalhado — 105 tasks (`backlog.md`)
-- [x] Documentação completa do projeto (`projeto.md`)
-- [x] Mock API — 40/40 testes passando (`mock_api/`)
-- [x] Infraestrutura AWS — E1 (Terraform: `infrastructure/terraform/`)
-- [x] Implementação dos agentes — E2 (`domains/consignado/` + `src/agents/` + `src/main.py`)
-- [x] Integração com APIs banQi — E3 (`src/tools/`: 8 tools MCP)
-- [x] Handler de webhooks — E4 (`src/webhook/`: Lambda handler + router + eventos)
-- [ ] Testes E2E e go-live — E5
+| Entregável | Status |
+|---|---|
+| Especificação da arquitetura (`specs/spec.md`) | Concluído |
+| Fluxo conversacional turno a turno (`specs/pipeline/po-brief.md`) | Concluído |
+| Mock API — 40/40 testes passando (`mock_api/`) | Concluído |
+| Infraestrutura AWS — E1 (`infrastructure/terraform/`) | Código pronto, aguardando ambiente |
+| Implementação dos agentes — E2 (`domains/` + `src/agents/`) | Código pronto |
+| Integração com APIs banQi — E3 (`src/tools/`) | Código pronto, aguardando sandbox |
+| Handler de webhooks — E4 (`src/webhook/`) | Código pronto |
+| Ambiente local completo (`docker-compose.yml`) | Concluído |
+| Testes E2E e go-live — E5 | Aguardando ambiente banQi |
 
 ---
 
-*Desenvolvido por CI&T para banQi · Stack: Python · Strands Agents SDK · AWS Bedrock AgentCore*
+## Referências
+
+| Arquivo | Conteúdo |
+|---|---|
+| `specs/banQi_conversacional/spec.md` | Arquitetura técnica completa dos agentes e tools |
+| `specs/banQi_conversacional/pipeline/po-brief.md` | Fluxo conversacional turno a turno |
+| `api/openapi-wpp-etapas-1-2-3-4.yaml` | Contratos das APIs (etapas 1-4) |
+| `api/openapi-wpp-etapas-5-6-7.yaml` | Contratos das APIs (etapas 5-7) |
+| `fluxo_trabalho/*.pdf` | Diagramas de sequência fornecidos pela banQi |
+| `cod_poc/` | Código da PoC de referência (CI&T) |
+
+---
+
+*Desenvolvido por CI&T para banQi · Python · Strands Agents SDK · AWS Bedrock AgentCore*

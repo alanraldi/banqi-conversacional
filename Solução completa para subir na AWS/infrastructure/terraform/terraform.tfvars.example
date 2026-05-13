@@ -1,0 +1,23 @@
+# =============================================================================
+# terraform.tfvars — copiar para terraform.tfvars e preencher
+# NUNCA commitar o terraform.tfvars (contém secrets)!
+# =============================================================================
+
+# Core
+aws_region     = "us-east-1"
+environment    = "staging"          # dev | staging | prod
+aws_account_id = "123456789012"     # sua conta AWS
+
+# Rede (use "create" para criar nova VPC ou "existing" para reutilizar)
+vpc_mode = "create"
+vpc_cidr = "10.0.0.0/16"
+# vpc_name = "minha-vpc-existente"  # apenas quando vpc_mode = "existing"
+
+# API banQi
+banqi_api_base_url = "https://api.banqi.com.br"
+
+# WhatsApp Business API (Meta Developer Portal)
+whatsapp_token           = "EAAxxxxxxxxxx..."
+whatsapp_app_secret      = "abc123def456..."
+whatsapp_verify_token    = "meu-token-secreto-unico"
+whatsapp_phone_number_id = "123456789012345"

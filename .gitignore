@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Logs
+*.log
+
+# Ambiente local
+.env
+.env.local
+
+# Claude Code
+.claude/
+
+# Editor
+.vscode/
+*.swp

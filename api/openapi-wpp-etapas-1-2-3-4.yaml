@@ -1,0 +1,1355 @@
+openapi: 3.1.0
+
+info:
+  title: Payroll Loan — WhatsApp API (Etapas 1 a 4)
+  version: "1.1.0"
+  description: |
+    Contrato das Etapas 1 a 4 do fluxo de contratação de empréstimo consignado via WhatsApp.
+
+    ## Visão Geral do Fluxo
+
+    ```
+    ETAPA 1 — Saudação e Geração do Termo
+    ──────────────────────────────────────
+    [Cliente] → inicia conversa no WhatsApp
+    [Agente]  → solicita CPF e nome
+    [Cliente] → informa CPF e nome
+
+    POST /v1/whatsapp/consent-term
+      Headers: x-whatsapp-phone, x-document (CPF), x-partner
+      Body:    { "name": "João da Silva" }
+      ↳ 406  → telefone já tem 3+ CPFs vinculados (síncrono)
+      ↳ 409  → usuário já possui termo ativo TOKEN_GENERATED (síncrono)
+      ↳ 202  → processamento assíncrono iniciado
+              [sucesso] webhook: CONSENT_TERM_FILE_READY (pdf em Base64)
+              [erro]    webhook: NO_OFFER_AVAILABLE (errorCode: PDF_GENERATION_ERROR)
+
+    ETAPA 2 — Elegibilidade e Aceite
+    ──────────────────────────────────────
+    [Agente]  → envia PDF ao cliente e solicita aceite
+    [Cliente] → aceita o termo
+
+    POST /v1/whatsapp/consent-term/accept
+      Header: x-whatsapp-phone, x-partner
+      Body:   { "ip": "...", "userAgent": "..." }
+      ↳ 200  → aceite registrado; fluxo assíncrono disparado:
+               1. Gera token no Dataprev
+               2. Consulta margem
+               3. Gera simulação automática (valores máximos)
+              [sucesso]    webhook: SIMULATION_READY
+              [sem margem] webhook: NO_OFFER_AVAILABLE (errorCode: ELIGIBILITY_REJECTED)
+              [erro]       webhook: NO_OFFER_AVAILABLE (errorCode: TOKEN_GENERATION_ERROR | SIMULATION_ERROR)
+
+    ETAPA 3 — Simulação (Seleção Manual)
+    ──────────────────────────────────────
+    [Agente]  → apresenta opções do SIMULATION_READY
+    [Cliente] → seleciona amount e/ou numInstallments
+
+    POST /v1/whatsapp/simulations
+      Header: x-whatsapp-phone, x-document, x-partner
+      Body:   { "amount": 5000.00, "numInstallments": [12, 24] }
+      ↳ 422  → pré-condição de termo não atendida (síncrono)
+      ↳ 200  → cache hit: simulação já existe, retorna resultado imediatamente
+      ↳ 202  → cache miss: processamento assíncrono
+              [sucesso]    webhook: SIMULATION_COMPLETED (status: SUCCESS)
+              [sem margem] webhook: SIMULATION_COMPLETED (status: ELIGIBILITY_REJECTED)
+              [erro]       webhook: SIMULATION_COMPLETED (status: ERROR)
+
+    GET /v1/whatsapp/simulations?idCorrelation=xxx
+      → fallback/polling para verificar status de simulação assíncrona
+
+    ETAPA 4 — Dados Cadastrais + Criação da Proposta
+    ──────────────────────────────────────
+    [Agente]  → coleta dados pessoais, endereço e desembolso
+    [Cliente] → confirma dados
+
+    POST /v1/whatsapp/proposals
+      Header: x-whatsapp-phone, x-document, x-partner
+      Body:   { idSimulation, email, address, bankAccount }
+      ↳ 412  → pré-condição de simulação não atendida (síncrono)
+      ↳ 202  → proposta registrada; webhook: PROPOSAL_CREATED
+      Nota: name, sex, nationality, occupation vêm do account service (x-user-data)
+    ```
+
+    ## Identificação do Usuário
+
+    | Header | Obrigatório em | Descrição |
+    |--------|---------------|-----------|
+    | `x-whatsapp-phone` | Todos os endpoints | Número E.164 do cliente |
+    | `x-document` | **Todos os endpoints** | CPF (11 dígitos) |
+    | `x-partner` | Todos os endpoints | Identificador do parceiro WPP (ex: blip, magie) |
+
+    ## Pré-requisitos por Etapa
+
+    | Etapa | Pré-requisito | Endpoint |
+    |-------|--------------|----------|
+    | Geração do termo | Nenhum — cria `WhatsAppUser` se primeiro contato | `POST /consent-term` |
+    | Aceite do termo | Termo com status `CREATED` | `POST /consent-term/accept` |
+    | Simulação manual | Termo com status `TOKEN_GENERATED` | `POST /simulations` |
+    | Criação da proposta | Simulação com status `SUCCESS` e vigente | `POST /proposals` |
+
+    ## Eventos disparados pelo serviço → agente
+
+    > O serviço faz POST no endpoint do agente WhatsApp cadastrado.
+
+    | Evento | Etapa | Quando |
+    |--------|-------|--------|
+    | `CONSENT_TERM_FILE_READY` | 1 | PDF gerado com sucesso |
+    | `NO_OFFER_AVAILABLE` | 1 e 2 | Falha ou inelegibilidade |
+    | `SIMULATION_READY` | 2 | Simulação automática gerada com sucesso |
+    | `SIMULATION_ERROR` | 2 | Falha no fluxo automático de simulação |
+    | `SIMULATION_COMPLETED` | 3 | Simulação manual processada (cache miss) |
+    | `PROPOSAL_CREATED` | 4 | Proposta criada com sucesso |
+
+    ### CONSENT_TERM_FILE_READY
+    ```json
+    {
+      "event": "CONSENT_TERM_FILE_READY",
+      "phone": "+5511999999999",
+      "idCorrelation": "ct-abc123",
+      "consentTerm": {
+        "status": "CREATED",
+        "pdf": "base64 PDF string",
+        "expirationAt": "2026-05-24T10:30:00.000Z"
+      }
+    }
+    ```
+
+    ### NO_OFFER_AVAILABLE
+    Cobre todos os caminhos de erro e inelegibilidade das Etapas 1 e 2.
+
+    | `errorCode` | Origem |
+    |-------------|--------|
+    | `PDF_GENERATION_ERROR` | Falha assíncrona na geração do PDF |
+    | `TOKEN_GENERATION_ERROR` | Falha ao gerar token no Dataprev |
+    | `ELIGIBILITY_REJECTED` | Cliente sem margem ou não elegível |
+    | `SIMULATION_ERROR` | Falha técnica na geração da simulação automática |
+
+    ```json
+    {
+      "event": "NO_OFFER_AVAILABLE",
+      "phone": "+5511999999999",
+      "idCorrelation": "ct-abc123",
+      "errorCode": "PDF_GENERATION_ERROR",
+      "reason": "Falha na geração do PDF do termo de consentimento"
+    }
+    ```
+
+    ### SIMULATION_READY
+    ```json
+    {
+      "event": "SIMULATION_READY",
+      "phone": "+5511999999999",
+      "idCorrelation": "sim-auto-abc123",
+      "simulation": {
+        "status": "SUCCESS",
+        "simulations": [
+          {
+            "idSimulation": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "amount": 8000.00,
+            "numInstallments": 24,
+            "simulationData": {
+              "financedAmount": 8800.00,
+              "disbursementAmount": 8000.00,
+              "paymentAmount": 490.50,
+              "totalAmountOwed": 11772.00,
+              "monthlyEffectiveInterestRate": 1.99,
+              "annualEffectiveInterestRate": 26.68,
+              "iofAmount": 240.00,
+              "disbursementDate": "2026-05-01"
+            }
+          }
+        ]
+      }
+    }
+    ```
+
+    ### SIMULATION_ERROR
+    ```json
+    {
+      "event": "SIMULATION_ERROR",
+      "phone": "+5511999999999",
+      "idCorrelation": "sim-auto-abc123",
+      "simulation": {
+        "status": "ERROR",
+        "reason": "Falha na comunicação com a plataforma de simulação"
+      }
+    }
+    ```
+
+    ### SIMULATION_COMPLETED
+    Disparado por `POST /simulations` quando cache miss (202). Use `idCorrelation` para correlacionar.
+
+    ```json
+    {
+      "event": "SIMULATION_COMPLETED",
+      "phone": "+5511999999999",
+      "idCorrelation": "sim-xyz789",
+      "simulation": {
+        "status": "SUCCESS",
+        "simulations": [
+          {
+            "idSimulation": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "amount": 5000.00,
+            "numInstallments": 12,
+            "simulationData": {
+              "financedAmount": 5500.00,
+              "disbursementAmount": 5000.00,
+              "paymentAmount": 520.50,
+              "totalAmountOwed": 6246.00,
+              "monthlyEffectiveInterestRate": 1.99,
+              "annualEffectiveInterestRate": 26.68,
+              "iofAmount": 150.00,
+              "disbursementDate": "2026-05-01"
+            }
+          }
+        ]
+      }
+    }
+    ```
+
+    ### PROPOSAL_CREATED
+    Disparado após criação bem-sucedida da proposta na plataforma de crédito (Etapa 4).
+
+    ```json
+    {
+      "event": "PROPOSAL_CREATED",
+      "phone": "+5511999999999",
+      "idCorrelation": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+      "proposal": {
+        "idProposal": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+        "status": "CREATED"
+      }
+    }
+    ```
+
+servers:
+  - url: http://localhost:3000/api
+    description: Local (devbox / yarn start:dev)
+  - url: http://payroll-loan.airfox.localtest.me/api
+    description: Local (bin/start-service / reverse-proxy)
+  - url: https://api-internal.sandbox.credito.banqi.com/credit-payroll-loan/api
+    description: dev
+
+tags:
+  - name: Etapa 1 — Termo de Consentimento
+    description: |
+      Geração assíncrona do PDF do termo de consentimento.
+      Resultado via webhook `CONSENT_TERM_FILE_READY` ou `NO_OFFER_AVAILABLE`.
+  - name: Etapa 2 — Aceite e Simulação Automática
+    description: |
+      Aceite do termo. Após aceite, gera token Dataprev, consulta margem e dispara
+      simulação automática. Resultado via `SIMULATION_READY` ou `NO_OFFER_AVAILABLE`.
+  - name: Etapa 3 — Simulação Manual
+    description: |
+      Simulação com amount e parcelas escolhidos pelo cliente.
+      Cache hit → 200 imediato. Cache miss → 202 + webhook `SIMULATION_COMPLETED`.
+      **Pré-requisito:** Termo com status `TOKEN_GENERATED`.
+  - name: Etapa 4 — Dados Cadastrais e Proposta
+    description: |
+      Coleta e-mail, endereço e dados bancários do cliente e cria a proposta.
+      Dados como nome, sexo, nacionalidade e ocupação são obtidos automaticamente do account service.
+      **Pré-requisito:** Simulação com status `SUCCESS` e vigente.
+
+      O endpoint `POST /proposals` é **sempre assíncrono** — retorna `202` e o resultado
+      chega via webhook `PROPOSAL_CREATED`.
+
+paths:
+  /v1/whatsapp/consent-term:
+    post:
+      operationId: createConsentTerm
+      summary: Gera o termo de consentimento (Etapa 1)
+      description: |
+        Solicita a geração do PDF do termo de consentimento para o usuário.
+        É o **primeiro endpoint** chamado no fluxo — cria o `WhatsAppUser` vinculando
+        o telefone ao CPF e dispara geração assíncrona do PDF.
+
+        ### Entradas
+
+        | Campo | Onde | Tipo | Obrigatório | Descrição |
+        |-------|------|------|-------------|-----------|
+        | `x-whatsapp-phone` | Header | string (E.164) | Sim | Telefone do cliente |
+        | `x-document` | Header | string (11 dígitos) | Sim | CPF do cliente |
+        | `x-partner` | Header | string | Sim | Identificador do parceiro WPP |
+        | `name` | Body | string | Sim | Nome completo do cliente |
+
+        ### Processamento assíncrono
+        Resposta `202` é imediata. Resultado via evento:
+        - **`CONSENT_TERM_FILE_READY`** — PDF em Base64 pronto para envio ao cliente
+        - **`NO_OFFER_AVAILABLE`** com `errorCode: PDF_GENERATION_ERROR` — falha na geração
+
+        ### Erro síncrono
+        Se o telefone já tiver **3 ou mais CPFs vinculados**, retorna `HTTP 406` imediatamente.
+      tags:
+        - Etapa 1 — Termo de Consentimento
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConsentTermRequest"
+            example:
+              name: "João da Silva"
+      responses:
+        "202":
+          description: |
+            **Assíncrono** — PDF em geração. Resultado via evento:
+            `CONSENT_TERM_FILE_READY` (sucesso) ou `NO_OFFER_AVAILABLE` (erro).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConsentTermAsyncResponse"
+              example:
+                status: GENERATING
+                message: "Termo de consentimento sendo gerado. Aguarde o evento CONSENT_TERM_FILE_READY."
+        "400":
+          description: CPF com formato inválido ou `name` ausente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidDocument:
+                  summary: CPF inválido
+                  value:
+                    statusCode: 400
+                    message: "Header 'x-document' deve conter 11 dígitos numéricos"
+                    error: Bad Request
+                missingName:
+                  summary: Nome ausente
+                  value:
+                    statusCode: 400
+                    message: "Campo 'name' é obrigatório"
+                    error: Bad Request
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "406":
+          description: |
+            Número de telefone já possui 3 ou mais CPFs vinculados.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 406
+                message: "Limite de CPFs vinculados ao número atingido. Máximo permitido: 3."
+                error: Not Acceptable
+        "409":
+          description: Usuário já possui termo ativo com status `TOKEN_GENERATED`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 409
+                message: "Usuário já possui um termo de consentimento ativo"
+                error: Conflict
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/whatsapp/consent-term/accept:
+    post:
+      operationId: acceptConsentTerm
+      summary: Aceita o termo e dispara simulação automática (Etapa 2)
+      description: |
+        Registra o aceite do termo pelo cliente e inicia o fluxo assíncrono.
+
+        ### Pré-requisito
+        Termo de consentimento com status `CREATED`.
+
+        ### Fluxo assíncrono após aceite
+
+        ```
+        POST /consent-term/accept
+              │
+              ▼
+        Dataprev: gera token de autorização
+              │
+              ├─ [falha] ──────► NO_OFFER_AVAILABLE (TOKEN_GENERATION_ERROR)
+              │
+              ▼
+        Consulta de margem (Dataprev)
+              │
+              ├─ [sem margem] ─► NO_OFFER_AVAILABLE (ELIGIBILITY_REJECTED)
+              │
+              ▼
+        Geração de simulação automática (valores máximos)
+              │
+              ├─ [erro] ───────► NO_OFFER_AVAILABLE (SIMULATION_ERROR)
+              │
+              └─ [sucesso] ────► SIMULATION_READY
+        ```
+
+        ### Eventos resultantes
+
+        | Evento | Condição | `errorCode` |
+        |--------|----------|-------------|
+        | `SIMULATION_READY` | Simulação gerada com sucesso | — |
+        | `NO_OFFER_AVAILABLE` | Cliente não elegível | `ELIGIBILITY_REJECTED` |
+        | `NO_OFFER_AVAILABLE` | Falha no token Dataprev | `TOKEN_GENERATION_ERROR` |
+        | `NO_OFFER_AVAILABLE` | Falha na simulação | `SIMULATION_ERROR` |
+      tags:
+        - Etapa 2 — Aceite e Simulação Automática
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcceptConsentTermRequest"
+            example:
+              userAgent: "WhatsApp/2.23.0 iOS/16.0"
+              ip: "192.168.1.100"
+      responses:
+        "200":
+          description: |
+            Aceite registrado. Fluxo assíncrono disparado.
+            Aguarde: `SIMULATION_READY` ou `NO_OFFER_AVAILABLE`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptConsentTermResponse"
+              example:
+                status: GENERATING_TOKEN
+                message: "Aceite registrado. Simulação automática será disparada após geração do token."
+                simulationTriggered: true
+        "400":
+          description: Requisição inválida
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 400
+                message: "Campo 'ip' é obrigatório"
+                error: Bad Request
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "404":
+          description: Termo de consentimento não encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 404
+                message: "Termo de consentimento não encontrado"
+                error: Not Found
+        "409":
+          description: Termo já foi aceito (status `TOKEN_GENERATED`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 409
+                message: "Termo de consentimento já foi aceito"
+                error: Conflict
+        "422":
+          description: Termo não está em status `CREATED` (expirado ou com erro)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                expired:
+                  summary: Termo expirado
+                  value:
+                    statusCode: 422
+                    message: "Termo de consentimento expirado. Solicite novo termo."
+                    error: Unprocessable Entity
+                hasError:
+                  summary: Termo com erro
+                  value:
+                    statusCode: 422
+                    message: "Termo de consentimento com erro. Solicite novo termo."
+                    error: Unprocessable Entity
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/whatsapp/simulations:
+    post:
+      operationId: createSimulation
+      summary: Solicita simulação com parâmetros escolhidos pelo cliente (Etapa 3)
+      description: |
+        Solicita simulação com `amount` e `numInstallments` selecionados pelo cliente.
+
+        ### Pré-requisito
+        Termo com status `TOKEN_GENERATED`. Caso contrário, retorna `422`.
+
+        ### Lógica de cache
+        - **Cache hit** (simulação já existe para o mesmo `amount` + `numInstallments`):
+          Retorna `200` com a simulação completa imediatamente.
+        - **Cache miss** (simulação não existe ou parâmetros diferentes):
+          Retorna `202` com `idCorrelation`. Resultado via webhook `SIMULATION_COMPLETED`.
+
+        ### Erros de pré-condição (`422`)
+
+        | `errorCode` | Situação |
+        |-------------|----------|
+        | `CONSENT_TERM_NOT_FOUND` | Nenhum termo encontrado |
+        | `CONSENT_TERM_INVALID_STATUS` | Termo com status `CREATED` ou `HAS_ERROR` |
+        | `TOKEN_EXPIRED` | Token do Dataprev expirado |
+      tags:
+        - Etapa 3 — Simulação Manual
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSimulationRequest"
+            examples:
+              withParams:
+                summary: Com amount e parcelas específicos
+                value:
+                  amount: 5000.00
+                  numInstallments: [12, 24]
+              automatic:
+                summary: Simulação automática (valores máximos)
+                value: {}
+      responses:
+        "200":
+          description: |
+            **Cache hit** — Simulação já existe. Retorna resultado completo imediatamente.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationCacheHitResponse"
+              example:
+                idCorrelation: "sim-abc123"
+                status: SUCCESS
+                simulations:
+                  - amount: 5000.00
+                    numInstallments: 12
+                    simulationData:
+                      financedAmount: 5500.00
+                      disbursementAmount: 5000.00
+                      paymentAmount: 520.50
+                      totalAmountOwed: 6246.00
+                      monthlyEffectiveInterestRate: 1.99
+                      annualEffectiveInterestRate: 26.68
+                      iofAmount: 150.00
+                      disbursementDate: "2026-05-01"
+        "202":
+          description: |
+            **Cache miss** — Simulação em processamento. Aguarde o webhook `SIMULATION_COMPLETED`
+            com o `idCorrelation` retornado.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationAsyncResponse"
+              example:
+                idCorrelation: "sim-xyz789"
+                status: WAITING
+                message: "Simulação em processamento. Aguarde o webhook SIMULATION_COMPLETED."
+        "400":
+          description: Parâmetros inválidos
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidAmount:
+                  summary: Valor inválido
+                  value:
+                    statusCode: 400
+                    message: "Campo 'amount' deve ser um número positivo"
+                    error: Bad Request
+                invalidInstallments:
+                  summary: Parcelas inválidas
+                  value:
+                    statusCode: 400
+                    message: "Campo 'numInstallments' deve conter inteiros positivos"
+                    error: Bad Request
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "422":
+          description: Pré-condição de termo não atendida
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationPreconditionError"
+              examples:
+                termNotFound:
+                  summary: Termo não encontrado
+                  value:
+                    statusCode: 422
+                    errorCode: CONSENT_TERM_NOT_FOUND
+                    message: "Nenhum termo de consentimento encontrado para o usuário"
+                    error: Unprocessable Entity
+                termInvalidStatus:
+                  summary: Termo não aceito
+                  value:
+                    statusCode: 422
+                    errorCode: CONSENT_TERM_INVALID_STATUS
+                    message: "Termo de consentimento deve estar com status TOKEN_GENERATED"
+                    error: Unprocessable Entity
+                tokenExpired:
+                  summary: Token expirado
+                  value:
+                    statusCode: 422
+                    errorCode: TOKEN_EXPIRED
+                    message: "Token do termo de consentimento expirou. Solicite novo termo."
+                    error: Unprocessable Entity
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    get:
+      operationId: getSimulations
+      summary: Consulta simulações existentes — fallback/polling (Etapa 3)
+      description: |
+        Consulta simulações existentes do usuário. Use com `idCorrelation` para verificar
+        o status de uma simulação assíncrona iniciada via `POST /simulations` (202).
+
+        Este endpoint é útil como **fallback** caso o agente reinicie e perca o webhook
+        `SIMULATION_COMPLETED`.
+      tags:
+        - Etapa 3 — Simulação Manual
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+        - name: idCorrelation
+          in: query
+          required: false
+          schema:
+            type: string
+          description: ID de correlação retornado no POST /simulations para rastrear simulação assíncrona.
+          example: "sim-xyz789"
+      responses:
+        "200":
+          description: Simulações retornadas com sucesso
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetSimulationsResponse"
+        "204":
+          description: Nenhuma simulação encontrada para os parâmetros informados
+        "400":
+          description: Parâmetros de consulta inválidos
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "422":
+          description: Pré-condição de termo não atendida (mesmos errorCodes do POST /simulations)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationPreconditionError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/whatsapp/proposals:
+    post:
+      operationId: createProposal
+      summary: Cria a proposta de crédito consignado (Etapa 4)
+      description: |
+        Cria a proposta com base na simulação selecionada pelo cliente e nos dados
+        cadastrais coletados pelo agente.
+
+        ### Pré-requisito
+        Simulação com status `SUCCESS` e vigente. Caso contrário, retorna `412`.
+
+        ### Dados coletados pelo agente na Etapa 4
+
+        O agente coleta os dados abaixo via conversa no WhatsApp antes de chamar este endpoint.
+        Dados como nome, sexo, nacionalidade e ocupação são obtidos automaticamente do account service
+        via `UserInterceptor` — **não precisam ser solicitados ao cliente**.
+
+        **E-mail**
+        - E-mail válido do cliente
+
+        **Endereço completo**
+        - Logradouro, número, complemento (opcional), bairro, cidade, estado, país, CEP
+
+        **Conta bancária para desembolso**
+        - Código do banco, agência, conta, dígito, tipo de conta (`CHECKING` | `PAYMENT` | `SALARY` | `SAVINGS`)
+        - ISPB opcional
+
+        ### Fluxo assíncrono após criação
+
+        Retorna `202` imediatamente com `idCorrelation`. O resultado chega via evento:
+        - **`PROPOSAL_CREATED`** — proposta criada com sucesso na plataforma de crédito
+      tags:
+        - Etapa 4 — Dados Cadastrais e Proposta
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProposalRequest"
+            example:
+              idSimulation: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              email: "joao.silva@email.com"
+              address:
+                street: "Rua das Flores"
+                number: "789"
+                complement: "Apto 42"
+                neighborhood: "Centro"
+                city: "Rio de Janeiro"
+                state: "RJ"
+                country: "Brasil"
+                zipCode: "20040030"
+              bankAccount:
+                bankCode: "341"
+                bankBranch: "1234"
+                bankAccount: "12345"
+                bankAccountDigit: "6"
+                bankAccountType: "CHECKING"
+      responses:
+        "202":
+          description: |
+            **Assíncrono** — Proposta registrada. Aguarde o evento `PROPOSAL_CREATED`
+            para confirmar a criação na plataforma de crédito.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateProposalResponse"
+              example:
+                idProposal: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+                idCorrelation: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+                status: CREATED
+        "400":
+          description: Requisição inválida (campos obrigatórios ausentes ou formato inválido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "412":
+          description: |
+            Pré-requisito não atendido. Pode ocorrer quando:
+            - Simulação não encontrada ou expirada
+            - Simulação com status diferente de `SUCCESS`
+            - Termo de consentimento sem status `TOKEN_GENERATED`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                simulationNotFound:
+                  summary: Simulação não encontrada
+                  value:
+                    statusCode: 412
+                    message: "Simulação não encontrada ou expirada"
+                    error: Precondition Failed
+                simulationNotSuccess:
+                  summary: Simulação não concluída
+                  value:
+                    statusCode: 412
+                    message: "Simulação deve estar com status SUCCESS para criar proposta"
+                    error: Precondition Failed
+        "422":
+          description: Falha na validação dos dados (ex. dados de desembolso inválidos)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 422
+                message: "Dados de desembolso inválidos"
+                error: Unprocessable Entity
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+# ─── COMPONENTS ──────────────────────────────────────────────────────────────
+components:
+  parameters:
+    WhatsAppPhoneHeader:
+      name: x-whatsapp-phone
+      in: header
+      required: true
+      description: Número de telefone do usuário WhatsApp no formato E.164.
+      example: "+5511999999999"
+      schema:
+        type: string
+        pattern: '^\+\d{10,15}$'
+
+    WhatsAppDocumentHeader:
+      name: x-document
+      in: header
+      required: true
+      description: |
+        CPF do usuário (somente dígitos, 11 caracteres).
+        Obrigatório em **todos os endpoints**.
+      example: "12345678900"
+      schema:
+        type: string
+        pattern: '^\d{11}$'
+
+    WhatsAppSourceHeader:
+      name: x-partner
+      in: header
+      required: true
+      description: "Identificador do parceiro WhatsApp que está realizando a requisição (ex.: blip, cit, magie)."
+      example: "blip"
+      schema:
+        type: string
+
+  responses:
+    UnauthorizedWhatsAppUser:
+      description: |
+        Usuário WhatsApp não encontrado. O `x-whatsapp-phone` não possui registro no sistema.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            statusCode: 401
+            message: "Usuário WhatsApp não encontrado para o telefone informado"
+            error: Unauthorized
+
+    InternalServerError:
+      description: Erro interno do servidor
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            statusCode: 500
+            message: "Internal server error"
+            error: Internal Server Error
+
+  schemas:
+    # ── Comum ─────────────────────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        error:
+          type: string
+
+    # ── Etapa 1 ───────────────────────────────────────────────────────────────
+    CreateConsentTermRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Nome completo do usuário
+          example: "João da Silva"
+
+    ConsentTermAsyncResponse:
+      type: object
+      required:
+        - status
+        - message
+      properties:
+        status:
+          type: string
+          enum:
+            - GENERATING
+        message:
+          type: string
+
+    # ── Etapa 2 ───────────────────────────────────────────────────────────────
+    AcceptConsentTermRequest:
+      type: object
+      required:
+        - ip
+      properties:
+        userAgent:
+          type: string
+          example: "WhatsApp/2.23.0 iOS/16.0"
+        ip:
+          type: string
+          example: "192.168.1.100"
+
+    AcceptConsentTermResponse:
+      type: object
+      required:
+        - status
+        - simulationTriggered
+      properties:
+        status:
+          type: string
+          enum:
+            - GENERATING_TOKEN
+        message:
+          type: string
+        simulationTriggered:
+          type: boolean
+          example: true
+
+    # ── Payloads dos eventos (referência) ─────────────────────────────────────
+    # Estes schemas documentam a estrutura dos eventos que o serviço
+    # envia ao agente WhatsApp. Não são endpoints da API.
+
+    EventConsentTermFileReady:
+      type: object
+      description: Evento enviado após geração bem-sucedida do PDF (Etapa 1).
+      required:
+        - event
+        - phone
+        - idCorrelation
+        - consentTerm
+      properties:
+        event:
+          type: string
+          enum: [CONSENT_TERM_FILE_READY]
+        phone:
+          type: string
+          example: "+5511999999999"
+        idCorrelation:
+          type: string
+          example: "ct-abc123"
+        consentTerm:
+          type: object
+          required: [status, pdf, expirationAt]
+          properties:
+            status:
+              type: string
+              enum: [CREATED]
+            pdf:
+              type: string
+              description: Conteúdo do PDF codificado em Base64
+              example: "JVBERi0xLjQKJeLjz9MK..."
+            expirationAt:
+              type: string
+              format: date-time
+              example: "2026-05-24T10:30:00.000Z"
+
+    EventSimulationReady:
+      type: object
+      description: Evento enviado pelo serviço ao agente após a geração bem-sucedida da simulação automática (Etapa 2).
+      required:
+        - event
+        - phone
+        - idCorrelation
+        - simulation
+      properties:
+        event:
+          type: string
+          enum: [SIMULATION_READY]
+        phone:
+          type: string
+          example: "+5511999999999"
+        idCorrelation:
+          type: string
+          example: "sim-auto-abc123"
+        simulation:
+          type: object
+          required: [status, simulations]
+          properties:
+            status:
+              type: string
+              enum: [SUCCESS]
+            simulations:
+              type: array
+              items:
+                $ref: "#/components/schemas/SimulationItem"
+
+    EventNoOfferAvailable:
+      type: object
+      description: |
+        Evento enviado pelo serviço ao agente em qualquer falha ou inelegibilidade (Etapas 1 e 2).
+        Use `errorCode` para distinguir a origem nos logs.
+      required:
+        - event
+        - phone
+        - idCorrelation
+        - errorCode
+      properties:
+        event:
+          type: string
+          enum: [NO_OFFER_AVAILABLE]
+        phone:
+          type: string
+          example: "+5511999999999"
+        idCorrelation:
+          type: string
+          example: "ct-abc123"
+        errorCode:
+          type: string
+          enum:
+            - PDF_GENERATION_ERROR
+            - TOKEN_GENERATION_ERROR
+            - ELIGIBILITY_REJECTED
+            - SIMULATION_ERROR
+          description: |
+            - `PDF_GENERATION_ERROR` — falha na geração do PDF
+            - `TOKEN_GENERATION_ERROR` — falha ao gerar token no Dataprev
+            - `ELIGIBILITY_REJECTED` — cliente sem margem ou não elegível
+            - `SIMULATION_ERROR` — falha na geração da simulação automática
+        reason:
+          type: string
+          nullable: true
+          example: "Margem insuficiente para concessão de crédito"
+
+    # ── Etapa 3 ───────────────────────────────────────────────────────────────
+    CreateSimulationRequest:
+      type: object
+      properties:
+        amount:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          description: Valor desejado. Se omitido, usa o valor máximo disponível.
+          example: 5000.00
+        numInstallments:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+          description: Parcelas desejadas. Se omitido, usa as máximas disponíveis.
+          example: [12, 24]
+
+    SimulationCacheHitResponse:
+      type: object
+      required:
+        - idCorrelation
+        - status
+        - simulations
+      description: Resposta quando simulação já existe em cache (200 OK)
+      properties:
+        idCorrelation:
+          type: string
+        status:
+          type: string
+          enum: [SUCCESS]
+        simulations:
+          type: array
+          items:
+            $ref: "#/components/schemas/SimulationItem"
+
+    SimulationAsyncResponse:
+      type: object
+      required:
+        - idCorrelation
+        - status
+      description: Resposta quando simulação será processada de forma assíncrona (202 Accepted)
+      properties:
+        idCorrelation:
+          type: string
+          description: ID para correlacionar com o webhook `SIMULATION_COMPLETED`.
+          example: "sim-xyz789"
+        status:
+          type: string
+          enum: [WAITING]
+        message:
+          type: string
+
+    GetSimulationsResponse:
+      type: object
+      required:
+        - simulations
+      properties:
+        simulations:
+          type: array
+          items:
+            $ref: "#/components/schemas/SimulationItemWithStatus"
+
+    SimulationPreconditionError:
+      type: object
+      required:
+        - statusCode
+        - errorCode
+        - message
+      properties:
+        statusCode:
+          type: integer
+          example: 422
+        errorCode:
+          type: string
+          enum:
+            - CONSENT_TERM_NOT_FOUND
+            - CONSENT_TERM_INVALID_STATUS
+            - TOKEN_EXPIRED
+        message:
+          type: string
+        error:
+          type: string
+          example: Unprocessable Entity
+
+    EventSimulationCompleted:
+      type: object
+      description: |
+        Evento enviado após processamento assíncrono de simulação manual (cache miss — Etapa 3).
+      required:
+        - event
+        - phone
+        - idCorrelation
+        - simulation
+      properties:
+        event:
+          type: string
+          enum: [SIMULATION_COMPLETED]
+        phone:
+          type: string
+          example: "+5511999999999"
+        idCorrelation:
+          type: string
+          example: "sim-xyz789"
+        simulation:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [SUCCESS, ERROR, ELIGIBILITY_REJECTED]
+            simulations:
+              type: array
+              items:
+                $ref: "#/components/schemas/SimulationItem"
+              description: Preenchido apenas quando status = SUCCESS
+            reason:
+              type: string
+              nullable: true
+              description: Motivo do erro ou rejeição (quando status != SUCCESS)
+
+    # ── Etapa 4 ───────────────────────────────────────────────────────────────
+    CreateProposalRequest:
+      type: object
+      required:
+        - idSimulation
+        - email
+        - address
+        - bankAccount
+      properties:
+        idSimulation:
+          type: string
+          format: uuid
+          description: ID da simulação com status SUCCESS
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        email:
+          type: string
+          format: email
+          description: E-mail do cliente
+          example: "joao.silva@email.com"
+        address:
+          $ref: "#/components/schemas/UserAddress"
+        bankAccount:
+          $ref: "#/components/schemas/BankAccount"
+
+    CreateProposalResponse:
+      type: object
+      required:
+        - idProposal
+        - idCorrelation
+        - status
+      properties:
+        idProposal:
+          type: string
+          format: uuid
+          description: Identificador da proposta criada (usar nas Etapas 5+)
+        idCorrelation:
+          type: string
+          description: Mesmo valor que idProposal — para rastreamento de webhooks
+        status:
+          type: string
+          enum: [CREATED]
+
+    UserAddress:
+      type: object
+      required:
+        - street
+        - city
+        - neighborhood
+        - state
+        - country
+        - zipCode
+      properties:
+        street:
+          type: string
+          example: "Rua das Flores"
+        number:
+          type: string
+          nullable: true
+          example: "789"
+        complement:
+          type: string
+          nullable: true
+          example: "Apto 42"
+        neighborhood:
+          type: string
+          example: "Centro"
+        city:
+          type: string
+          example: "Rio de Janeiro"
+        state:
+          type: string
+          description: Sigla do estado (2 letras)
+          example: "RJ"
+        country:
+          type: string
+          description: Nome ou código do país
+          example: "Brasil"
+        zipCode:
+          type: string
+          description: CEP sem traço (8 dígitos)
+          example: "20040030"
+
+    BankAccount:
+      type: object
+      required:
+        - bankCode
+        - bankBranch
+        - bankAccount
+        - bankAccountDigit
+        - bankAccountType
+      properties:
+        bankCode:
+          type: string
+          description: Código do banco (3 dígitos)
+          example: "341"
+        bankBranch:
+          type: string
+          example: "1234"
+        bankAccount:
+          type: string
+          example: "12345"
+        bankAccountDigit:
+          type: string
+          example: "6"
+        bankAccountType:
+          type: string
+          enum: [CHECKING, PAYMENT, SALARY, SAVINGS]
+        ispbCode:
+          type: string
+          nullable: true
+          description: Código ISPB do banco (opcional)
+
+    # ── Simulation shared schemas ─────────────────────────────────────────────
+    SimulationItem:
+      type: object
+      required: [idSimulation, amount, numInstallments, simulationData]
+      properties:
+        idSimulation:
+          type: string
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        amount:
+          type: number
+          example: 8000.00
+        numInstallments:
+          type: integer
+          example: 24
+        simulationData:
+          $ref: "#/components/schemas/SimulationData"
+
+    SimulationItemWithStatus:
+      allOf:
+        - $ref: "#/components/schemas/SimulationItem"
+        - type: object
+          properties:
+            idCorrelation:
+              type: string
+            status:
+              type: string
+              enum: [WAITING, SUCCESS, ERROR, ELIGIBILITY_REJECTED, INTERNAL_ERROR]
+            expiresAt:
+              type: string
+              format: date-time
+              nullable: true
+              description: Expiração da simulação (preenchido quando status = SUCCESS)
+
+    SimulationData:
+      type: object
+      properties:
+        financedAmount:
+          type: number
+          description: Valor total financiado (principal + encargos)
+          example: 8800.00
+        disbursementAmount:
+          type: number
+          description: Valor efetivamente recebido pelo cliente
+          example: 8000.00
+        totalProcessingCost:
+          type: number
+          description: Custo total de processamento (IOF + taxas)
+        financeFee:
+          type: number
+          description: Taxa de financiamento
+        contractFee:
+          type: number
+          description: Taxa de contrato
+        annualInterestRate:
+          type: number
+          description: Taxa de juros nominal anual (%)
+        annualEffectiveInterestRate:
+          type: number
+          description: CET anual (%)
+          example: 26.68
+        monthlyEffectiveInterestRate:
+          type: number
+          description: CET mensal (%)
+          example: 1.99
+        interestRate:
+          type: number
+          description: Taxa de juros mensal nominal (%)
+        paymentAmount:
+          type: number
+          description: Valor de cada parcela
+          example: 490.50
+        totalAmountOwed:
+          type: number
+          description: Total a pagar (principal + todos os encargos)
+          example: 11772.00
+        iofAmount:
+          type: number
+          description: Valor total do IOF
+          example: 240.00
+        disbursementDate:
+          type: string
+          format: date
+          description: Data prevista de desembolso
+          example: "2026-05-01"
+        installmentType:
+          type: string
+          description: Tipo de parcela (ex. FIXED)
+
+    # ── Webhooks Etapa 4 — Proposta ──────────────────────────────────────────
+    EventProposalCreated:
+      type: object
+      description: |
+        Evento enviado pelo serviço ao agente após criação bem-sucedida da proposta (Etapa 4).
+      required:
+        - event
+        - phone
+        - idCorrelation
+        - proposal
+      properties:
+        event:
+          type: string
+          enum: [PROPOSAL_CREATED]
+        phone:
+          type: string
+          example: "+5511999999999"
+        idCorrelation:
+          type: string
+          example: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+        proposal:
+          type: object
+          required: [idProposal, status]
+          properties:
+            idProposal:
+              type: string
+              example: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+            status:
+              type: string
+              enum: [CREATED]

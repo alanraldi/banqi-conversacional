@@ -1,0 +1,717 @@
+openapi: 3.1.0
+
+info:
+  title: Payroll Loan — WhatsApp API (Etapas 5 a 7)
+  version: "1.0.0"
+  description: |
+    Contrato das Etapas 5 a 7 do fluxo de contratação de empréstimo consignado via WhatsApp.
+
+    ## Visão Geral do Fluxo
+
+    ```
+    ETAPA 5 — Biometria
+    ──────────────────────────────────────
+    [Pré-requisito] Evento PROPOSAL_CREATED recebido da Etapa 4 (idProposal conhecido)
+
+    POST /v1/whatsapp/proposals/{idProposal}/biometry
+      Headers: x-whatsapp-phone, x-document, x-partner
+      ↳ 201  → sessão anti-fraude criada; retorna idAntiFraud + provider + status BIOMETRICS
+               O agente gera o BioLink e envia ao cliente via WhatsApp
+
+    [Cliente] → realiza liveness + face match no dispositivo (BioLink)
+
+    POST /v1/whatsapp/proposals/{idProposal}/biometry/continue
+      Headers: x-whatsapp-phone, x-document, x-partner
+      Body:    { idAntiFraud, idBiometric, provider }
+      ↳ 404  → sessão não encontrada para o idAntiFraud informado
+      ↳ 200  → status: APPROVED | BIOMETRICS | DENIED
+               APPROVED   → segue para Etapa 6
+               BIOMETRICS → em andamento; aguardar nova resposta do SDK
+               DENIED     → biometria reprovada; encerrar fluxo
+
+    ETAPA 6 — Aceite e Assinatura da Proposta
+    ──────────────────────────────────────
+    [Pré-requisito] Biometria com status APPROVED
+
+    POST /v1/whatsapp/proposals/{idProposal}/accept
+      Headers: x-whatsapp-phone, x-document, x-partner, x-remote-address, user-agent
+      Body:    { idBiometric }
+      ↳ 404  → proposta não encontrada (síncrono)
+      ↳ 200  → aceite registrado; dispara Trigger Evento Domínio "Confirmação da Contratação"
+               Resultado via webhook: PROPOSAL_STATUS_UPDATE (newStatus: ACCEPTED)
+
+    ETAPA 7 — Notificações Ativas de Status da Proposta (Webhooks)
+    ──────────────────────────────────────
+    [Agente] → escuta webhooks de atualização de status da proposta
+
+    Webhook: PROPOSAL_STATUS_UPDATE
+      Disparado a cada mudança de status na plataforma de crédito.
+      Use newStatus para guiar a comunicação com o cliente:
+
+      ACCEPTED          → proposta em processamento pelo provedor de crédito
+      SIGNED            → contrato assinado digitalmente (CCB registrada)
+      CCB_GENERATED     → CCB gerada (ccbUrl disponível)
+      FORMALIZED        → averbação aprovada (pendente desembolso)
+      PENDING_DISBURSEMENT → desembolso agendado
+      DISBURSED         → valor creditado na conta do cliente ✓
+      CANCELED          → proposta cancelada ✗
+      ERROR             → falha no processamento ✗ (ver providerCode + providerError)
+
+    Nota: caso o agente perca um webhook, consulte o status via
+    GET /v1/proposals/{idProposal} (endpoint interno — fora do escopo deste contrato WPP).
+    ```
+
+    ## Identificação do Usuário
+
+    | Header | Obrigatório em | Descrição |
+    |--------|---------------|-----------|
+    | `x-whatsapp-phone` | Todos os endpoints | Número E.164 do cliente |
+    | `x-document` | Todos os endpoints | CPF (11 dígitos) |
+    | `x-partner` | Todos os endpoints | Identificador do parceiro WPP (ex: blip, magie) |
+
+    ## Ciclo de Vida da Proposta
+
+    ```
+    CREATED  (evento PROPOSAL_CREATED — Etapa 4)
+       │
+       ▼  POST /biometry + /biometry/continue (APPROVED) + POST /accept
+    ACCEPTED ← Trigger Evento Domínio: Confirmação da Contratação
+       │
+       ▼ provedor assina CCB
+    SIGNED
+       │
+       ▼ CCB registrada no Dataprev
+    CCB_GENERATED
+       │
+       ▼ averbação aprovada
+    FORMALIZED
+       │
+       ▼ desembolso agendado
+    PENDING_DISBURSEMENT
+       │
+       ▼ crédito na conta
+    DISBURSED ✓
+
+    Em qualquer etapa:
+       ├─► CANCELED  (cancelamento pelo provedor ou cliente)
+       └─► ERROR     (falha técnica)
+    ```
+
+    ## Eventos disparados pelo serviço → agente
+
+    > O serviço faz POST no endpoint do agente WhatsApp cadastrado.
+
+    | Evento | Etapa | Quando |
+    |--------|-------|--------|
+    | `PROPOSAL_STATUS_UPDATE` | 7 | A cada mudança de status da proposta |
+
+    ### PROPOSAL_STATUS_UPDATE (sucesso)
+    ```json
+    {
+      "event": "PROPOSAL_STATUS_UPDATE",
+      "phone": "+5511999999999",
+      "idCorrelation": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+      "proposal": {
+        "idProposal": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+        "idSimulation": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "status": "SIGNED",
+        "newStatus": "SIGNED",
+        "disbursementAmount": 5000.00,
+        "disbursementDate": "2026-05-01",
+        "paymentAmount": 520.50,
+        "numPeriods": 12,
+        "signedAt": "2026-04-30T11:50:00.000Z",
+        "ccbUrl": null
+      }
+    }
+    ```
+
+    ### PROPOSAL_STATUS_UPDATE (erro)
+    ```json
+    {
+      "event": "PROPOSAL_STATUS_UPDATE",
+      "phone": "+5511999999999",
+      "idCorrelation": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+      "errorCode": "PROPOSAL_ERROR",
+      "providerCode": "E_500",
+      "proposal": {
+        "idProposal": "f1e2d3c4-b5a6-7890-abcd-ef1234567890",
+        "status": "ERROR",
+        "newStatus": "ERROR"
+      }
+    }
+    ```
+
+servers:
+  - url: http://localhost:3000/api
+    description: Local (devbox / yarn start:dev)
+  - url: http://payroll-loan.airfox.localtest.me/api
+    description: Local (bin/start-service / reverse-proxy)
+  - url: https://api-internal.sandbox.credito.banqi.com/credit-payroll-loan/api
+    description: dev
+
+tags:
+  - name: Etapa 5 — Biometria
+    description: |
+      Inicia e confirma o processo de biometria (liveness + face match) para a proposta.
+      **Pré-requisito:** Proposta com status `CREATED` (recebido via evento `PROPOSAL_CREATED` da Etapa 4).
+
+      Fluxo:
+      1. `POST /biometry` — cria sessão anti-fraude; retorna `idAntiFraud` + BioLink para o cliente
+      2. Cliente realiza liveness + face match no dispositivo móvel
+      3. `POST /biometry/continue` — confirma resultado; status `APPROVED` libera a Etapa 6
+  - name: Etapa 6 — Aceite e Assinatura da Proposta
+    description: |
+      Registra o aceite formal da proposta pelo cliente após biometria aprovada.
+      **Pré-requisito:** Biometria com status `APPROVED`.
+
+      Dispara o **Trigger Evento Domínio "Confirmação da Contratação"**, que inicia o
+      processamento assíncrono pelo provedor de crédito. O resultado chega via webhook
+      `PROPOSAL_STATUS_UPDATE` (Etapa 7).
+  - name: Etapa 7 — Notificações de Status da Proposta
+    description: |
+      O serviço dispara o webhook `PROPOSAL_STATUS_UPDATE` a cada mudança de status
+      da proposta na plataforma de crédito. O agente deve processar esses eventos para
+      manter o cliente informado sobre o andamento do contrato.
+
+      Caso o agente perca um webhook, pode consultar o status diretamente via
+      `GET /v1/proposals/{idProposal}` (endpoint interno da API, fora do escopo
+      deste contrato WhatsApp).
+
+paths:
+  /v1/whatsapp/proposals/{idProposal}/biometry:
+    post:
+      operationId: startProposalBiometry
+      summary: Inicia a biometria da proposta (Etapa 5)
+      description: |
+        Cria uma sessão de biometria (anti-fraude) para a proposta. A resposta contém
+        `idAntiFraud` que identifica a sessão no provedor (ex. Unico). O agente deve
+        usar esse ID para gerar o BioLink e enviá-lo ao cliente via WhatsApp para que
+        ele realize o liveness + face match no próprio dispositivo.
+
+        ### Pré-requisito
+        Proposta com status `CREATED` (evento `PROPOSAL_CREATED` da Etapa 4).
+
+        ### Campos retornados
+
+        | Campo | Tipo | Descrição |
+        |-------|------|-----------|
+        | `idAntiFraud` | string | ID da sessão no provedor de biometria |
+        | `provider` | string | Nome do provedor (ex. `unico`) |
+        | `status` | string | `BIOMETRICS` = sessão aberta, aguardando o cliente |
+
+        ### Próximo passo
+        Enviar o BioLink ao cliente via WhatsApp e aguardar a conclusão, então chamar
+        `POST /biometry/continue` com `idAntiFraud` + `idBiometric` retornados pelo SDK.
+      tags:
+        - Etapa 5 — Biometria
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+        - $ref: "#/components/parameters/IdProposalPath"
+      responses:
+        "201":
+          description: Sessão de biometria criada. Cliente deve acessar o BioLink para realizar o liveness.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProposalBiometryResponse"
+              example:
+                idAntiFraud: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+                provider: "unico"
+                status: "BIOMETRICS"
+        "400":
+          description: Headers obrigatórios ausentes ou inválidos
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 400
+                message: "Missing x-document header"
+                error: Bad Request
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/whatsapp/proposals/{idProposal}/biometry/continue:
+    post:
+      operationId: continueProposalBiometry
+      summary: Confirma o resultado da biometria (Etapa 5)
+      description: |
+        Submete o resultado do processo de biometria realizado pelo cliente no dispositivo.
+        O SDK do provedor (ex. Unico) retorna `idBiometric` após a conclusão — esse valor
+        deve ser enviado neste endpoint para que o serviço valide o resultado junto ao provedor.
+
+        ### Interpretação do status retornado
+
+        | `status` | Significado | Próximo passo |
+        |----------|-------------|---------------|
+        | `APPROVED` | Biometria aprovada ✓ | Seguir para Etapa 6 (`POST /accept`) |
+        | `BIOMETRICS` | Ainda em andamento | Aguardar nova resposta do SDK e chamar novamente |
+        | `DENIED` | Biometria reprovada ✗ | Encerrar fluxo; informar cliente |
+
+        ### Erro 404
+        Retornado quando o `idAntiFraud` não corresponde a nenhuma sessão aberta
+        para a proposta informada.
+      tags:
+        - Etapa 5 — Biometria
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+        - $ref: "#/components/parameters/IdProposalPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContinueProposalBiometryRequest"
+            example:
+              idAntiFraud: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+              idBiometric: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+              provider: "unico"
+      responses:
+        "200":
+          description: Resultado da biometria retornado com sucesso
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProposalBiometryResponse"
+              examples:
+                approved:
+                  summary: Biometria aprovada — seguir para Etapa 6
+                  value:
+                    idAntiFraud: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+                    provider: "unico"
+                    status: "APPROVED"
+                biometrics:
+                  summary: Biometria em andamento — aguardar SDK
+                  value:
+                    idAntiFraud: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+                    provider: "unico"
+                    status: "BIOMETRICS"
+                denied:
+                  summary: Biometria reprovada — encerrar fluxo
+                  value:
+                    idAntiFraud: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+                    provider: "unico"
+                    status: "DENIED"
+        "400":
+          description: Corpo da requisição inválido (UUIDs inválidos ou provider ausente)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+              example:
+                statusCode: 400
+                message:
+                  formErrors: []
+                  fieldErrors:
+                    idAntiFraud: ["Invalid uuid"]
+                    idBiometric: ["Invalid uuid"]
+                    provider: ["Required"]
+                error: Bad Request
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "404":
+          description: Sessão de biometria não encontrada para o `idAntiFraud` informado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 404
+                message: "Biometry not found for the given 'idAntiFraud'"
+                error: Not Found
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/whatsapp/proposals/{idProposal}/accept:
+    post:
+      operationId: acceptProposal
+      summary: Registra o aceite formal da proposta (Etapa 6)
+      description: |
+        Registra o consentimento do cliente e aciona o **Trigger Evento Domínio
+        "Confirmação da Contratação"**, que inicia o processamento assíncrono pelo
+        provedor de crédito.
+
+        ### Pré-requisito
+        Biometria com status `APPROVED`. O `idBiometric` retornado pela biometria aprovada
+        deve ser enviado no corpo da requisição.
+
+        ### Fluxo assíncrono após aceite
+
+        ```
+        POST /accept
+              │
+              ▼ Trigger Evento Domínio: Confirmação da Contratação
+              │
+              ▼ Provedor de crédito processa proposta
+        PROPOSAL_STATUS_UPDATE (newStatus: ACCEPTED)
+              │
+              ▼ CCB assinada digitalmente
+        PROPOSAL_STATUS_UPDATE (newStatus: SIGNED)
+              │
+              ▼ CCB registrada no Dataprev
+        PROPOSAL_STATUS_UPDATE (newStatus: CCB_GENERATED)
+              │
+              ▼ Averbação aprovada
+        PROPOSAL_STATUS_UPDATE (newStatus: FORMALIZED)
+              │
+              ▼ Desembolso agendado
+        PROPOSAL_STATUS_UPDATE (newStatus: PENDING_DISBURSEMENT)
+              │
+              ▼ Crédito na conta do cliente
+        PROPOSAL_STATUS_UPDATE (newStatus: DISBURSED) ✓
+        ```
+
+        ### Headers adicionais
+        `x-remote-address` deve ser o IP real do dispositivo do cliente (para registro
+        do aceite com fins de auditoria). `user-agent` é o agente do aplicativo do cliente.
+      tags:
+        - Etapa 6 — Aceite e Assinatura da Proposta
+      parameters:
+        - $ref: "#/components/parameters/WhatsAppPhoneHeader"
+        - $ref: "#/components/parameters/WhatsAppDocumentHeader"
+        - $ref: "#/components/parameters/WhatsAppSourceHeader"
+        - $ref: "#/components/parameters/IdProposalPath"
+        - $ref: "#/components/parameters/IpAddressHeader"
+        - $ref: "#/components/parameters/UserAgentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcceptProposalRequest"
+            example:
+              idBiometric: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+      responses:
+        "200":
+          description: |
+            Aceite registrado. Processamento assíncrono disparado.
+            Aguarde os webhooks `PROPOSAL_STATUS_UPDATE` (Etapa 7).
+        "400":
+          description: Corpo da requisição inválido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+              example:
+                statusCode: 400
+                message:
+                  formErrors: []
+                  fieldErrors:
+                    idBiometric: ["Invalid uuid"]
+                error: Bad Request
+        "401":
+          $ref: "#/components/responses/UnauthorizedWhatsAppUser"
+        "404":
+          description: Proposta não encontrada para o `idProposal` informado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                statusCode: 404
+                message: "Proposal not found for the given 'idProposal'"
+                error: Not Found
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+# ─── COMPONENTS ──────────────────────────────────────────────────────────────
+components:
+  parameters:
+    WhatsAppPhoneHeader:
+      name: x-whatsapp-phone
+      in: header
+      required: true
+      description: Número de telefone do usuário WhatsApp no formato E.164.
+      example: "+5511999999999"
+      schema:
+        type: string
+        pattern: '^\+\d{10,15}$'
+
+    WhatsAppDocumentHeader:
+      name: x-document
+      in: header
+      required: true
+      description: CPF do usuário (somente dígitos, 11 caracteres). Obrigatório em todos os endpoints.
+      example: "12345678900"
+      schema:
+        type: string
+        pattern: '^\d{11}$'
+
+    WhatsAppSourceHeader:
+      name: x-partner
+      in: header
+      required: true
+      description: "Identificador do parceiro WhatsApp (ex.: blip, cit, magie)."
+      example: "blip"
+      schema:
+        type: string
+
+    IdProposalPath:
+      name: idProposal
+      in: path
+      required: true
+      description: UUID da proposta (retornado no evento `PROPOSAL_CREATED` da Etapa 4).
+      example: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+      schema:
+        type: string
+        format: uuid
+
+    IpAddressHeader:
+      name: x-remote-address
+      in: header
+      required: true
+      description: Endereço IP do dispositivo do cliente no momento do aceite (auditoria).
+      example: "189.100.50.25"
+      schema:
+        type: string
+
+    UserAgentHeader:
+      name: user-agent
+      in: header
+      required: true
+      description: User-agent do browser/aplicativo do cliente.
+      example: "WhatsApp/2.23.0 iOS/16.0"
+      schema:
+        type: string
+
+  responses:
+    UnauthorizedWhatsAppUser:
+      description: |
+        Usuário WhatsApp não encontrado. O `x-whatsapp-phone` não possui registro no sistema.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            statusCode: 401
+            message: "Usuário WhatsApp não encontrado para o telefone informado"
+            error: Unauthorized
+
+    InternalServerError:
+      description: Erro interno do servidor
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            statusCode: 500
+            message: "Internal server error"
+            error: Internal Server Error
+
+  schemas:
+    # ── Comum ─────────────────────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        error:
+          type: string
+
+    ValidationErrorResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+      properties:
+        statusCode:
+          type: integer
+          example: 400
+        message:
+          type: object
+          properties:
+            formErrors:
+              type: array
+              items:
+                type: string
+            fieldErrors:
+              type: object
+              additionalProperties:
+                type: array
+                items:
+                  type: string
+        error:
+          type: string
+          example: Bad Request
+
+    # ── Etapa 5 ───────────────────────────────────────────────────────────────
+    ProposalBiometryResponse:
+      type: object
+      required:
+        - idAntiFraud
+        - status
+      description: |
+        Resposta dos endpoints de biometria (iniciar e continuar).
+        O campo `status` indica o estado atual da sessão no provedor.
+      properties:
+        idAntiFraud:
+          type: string
+          description: ID único da sessão de biometria no provedor anti-fraude
+          example: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+        provider:
+          type: string
+          description: Nome do provedor de biometria (ex. `unico`)
+          example: "unico"
+        status:
+          type: string
+          enum:
+            - APPROVED
+            - BIOMETRICS
+            - DENIED
+          description: |
+            - `APPROVED`   — biometria aprovada; prosseguir com aceite da proposta
+            - `BIOMETRICS` — sessão aberta, aguardando conclusão pelo cliente
+            - `DENIED`     — biometria reprovada; encerrar fluxo
+
+    ContinueProposalBiometryRequest:
+      type: object
+      required:
+        - idAntiFraud
+        - idBiometric
+        - provider
+      properties:
+        idAntiFraud:
+          type: string
+          format: uuid
+          description: ID da sessão retornado pelo `POST /biometry`
+          example: "d4e5f6a7-b8c9-0123-def0-123456789abc"
+        idBiometric:
+          type: string
+          format: uuid
+          description: ID do resultado retornado pelo SDK do provedor após o liveness
+          example: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+        provider:
+          type: string
+          description: Nome do provedor (deve coincidir com o retornado em `POST /biometry`)
+          example: "unico"
+
+    # ── Etapa 6 ───────────────────────────────────────────────────────────────
+    AcceptProposalRequest:
+      type: object
+      required:
+        - idBiometric
+      properties:
+        idBiometric:
+          type: string
+          format: uuid
+          description: ID do resultado da biometria aprovada
+          example: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+
+    # ── Webhooks Etapa 7 — Status da Proposta ─────────────────────────────────
+    EventProposalStatusUpdate:
+      type: object
+      description: |
+        Webhook disparado pelo serviço ao agente a cada mudança de status da proposta.
+        Contém snapshot completo da proposta com os dados financeiros.
+        Use `newStatus` para guiar a comunicação com o cliente.
+      required:
+        - event
+        - phone
+        - idCorrelation
+        - proposal
+      properties:
+        event:
+          type: string
+          enum: [PROPOSAL_STATUS_UPDATE]
+        phone:
+          type: string
+          description: Telefone E.164 do cliente
+          example: "+5511999999999"
+        idCorrelation:
+          type: string
+          description: Mesmo valor que idProposal
+          example: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+        errorCode:
+          type: string
+          nullable: true
+          enum: [PROPOSAL_ERROR]
+          description: Preenchido apenas quando status = ERROR
+        providerCode:
+          nullable: true
+          description: Código de erro do provedor (quando status = ERROR)
+          example: "E_500"
+        providerError:
+          nullable: true
+          description: Mensagem de erro do provedor (quando status = ERROR)
+          example: "Internal provider error"
+        proposal:
+          type: object
+          required:
+            - idProposal
+            - status
+            - newStatus
+          properties:
+            idProposal:
+              type: string
+              format: uuid
+              example: "f1e2d3c4-b5a6-7890-abcd-ef1234567890"
+            idSimulation:
+              type: string
+              format: uuid
+              example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            status:
+              type: string
+              enum:
+                - ACCEPTED
+                - CANCELED
+                - CCB_GENERATED
+                - CREATED
+                - DISBURSED
+                - FORMALIZED
+                - ERROR
+                - PENDING_DISBURSEMENT
+                - SIGNED
+            newStatus:
+              type: string
+              enum:
+                - ACCEPTED
+                - CANCELED
+                - CCB_GENERATED
+                - CREATED
+                - DISBURSED
+                - FORMALIZED
+                - ERROR
+                - PENDING_DISBURSEMENT
+                - SIGNED
+              description: Novo status da proposta após a atualização
+            disbursementAmount:
+              type: number
+              nullable: true
+              example: 5000.00
+            disbursementDate:
+              type: string
+              format: date
+              nullable: true
+              example: "2026-05-01"
+            paymentAmount:
+              type: number
+              nullable: true
+              example: 520.50
+            numPeriods:
+              type: integer
+              nullable: true
+              example: 12
+            signedAt:
+              type: string
+              format: date-time
+              nullable: true
+            ccbUrl:
+              type: string
+              nullable: true
+              description: URL da CCB (disponível a partir de CCB_GENERATED)
+            disbursedAt:
+              type: string
+              format: date-time
+              nullable: true

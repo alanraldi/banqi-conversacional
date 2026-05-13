@@ -1,0 +1,50 @@
+domain:
+  name: "BanQi Consignado"
+  slug: "banqi-consignado"
+  description: "Agente de empréstimo consignado via WhatsApp"
+  language_default: "pt-BR"
+
+agent:
+  name: "banqi_consignado_agent"
+  memory_name: "BanqiConsignadoMemory"
+  session_prefix: "consignado-session"
+
+supervisor:
+  prompt_file: "prompts/supervisor.md"
+  description: "Supervisor que classifica intenção e roteia para agentes especializados"
+  model_id_env: "SUPERVISOR_AGENT_MODEL_ID"
+
+sub_agents:
+  consignado:
+    name: "Consignado Agent"
+    description: "Conduz o fluxo completo de contratação de empréstimo consignado (etapas 1-7)"
+    prompt_file: "prompts/consignado.md"
+    tool_docstring: "Processa e conduz o fluxo de contratação de empréstimo consignado: coleta dados, chama APIs banQi, acompanha status"
+    model_id_env: "CONSIGNADO_AGENT_MODEL_ID"
+    tools_source: "gateway_mcp"
+  general:
+    name: "General Agent"
+    description: "Responde mensagens fora do escopo do empréstimo consignado"
+    prompt_file: "prompts/general.md"
+    tool_docstring: "Responde mensagens que não são sobre empréstimo consignado com uma mensagem padrão de escopo"
+    model_id_env: "GENERAL_AGENT_MODEL_ID"
+    tools_source: "none"
+
+memory:
+  namespaces:
+    users/{user_id}/consignado:
+      top_k: 10
+      relevance_score: 0.5
+    summaries/{user_id}/{session_id}:
+      top_k: 3
+      relevance_score: 0.4
+
+channels:
+  whatsapp:
+    enabled: true
+    type: webhook
+
+error_messages:
+  generic: "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
+  out_of_scope: "Posso te ajudar apenas com empréstimo consignado. Quer simular ou contratar?"
+  empty_input: "Não entendi sua mensagem. Quer simular ou contratar um empréstimo consignado?"

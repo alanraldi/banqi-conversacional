@@ -1,0 +1,134 @@
+"""PII masking para logs — conformidade LGPD.
+
+DECISÃO DE DESIGN: Preferimos falsos positivos (mascarar demais) a falsos
+negativos (vazar PII). Um número de 11 dígitos que não é CPF será mascarado —
+isso é inconveniente para debug mas aceitável. Um CPF vazado é violação legal.
+
+Para debug, use a fonte original de dados (banco de dados, API), não os logs.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+# Padrões de PII: CPF, telefone, email, CEP, dados bancários
+# NOTA: O padrão de CPF pode casar com sequências de 11 dígitos que não são CPF.
+_PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # CPF formatado (123.456.789-00) ou sem formatação (12345678900)
+    (re.compile(r"\b\d{3}[.\s]?\d{3}[.\s]?\d{3}[-.\s]?\d{2}\b"), "***.***.***-**"),
+    # Telefone com DDD e código do país
+    (re.compile(r"\b\+?\d{1,3}[\s-]?\(?\d{2}\)?[\s-]?\d{4,5}[-.\s]?\d{4}\b"), "***-****-****"),
+    # Telefone sem formatação (ex: 5511999999999)
+    (re.compile(r"\b\d{10,13}\b"), "****-****"),
+    # Email
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"), "***@***.***"),
+    # CEP formatado (12345-678) ou sem formatação (12345678)
+    (re.compile(r"\b\d{5}-?\d{3}\b"), "*****-***"),
+    # Número de agência bancária (4-6 dígitos isolados — pode ter falso positivo)
+    (re.compile(r"\bagencia[:\s]+\d{4,6}(-\d)?\b", re.IGNORECASE), "agencia: ****"),
+    # Número de conta bancária (formato: dígitos-dígito verificador)
+    (re.compile(r"\bconta[:\s]+\d{4,12}-?\d\b", re.IGNORECASE), "conta: ****-*"),
+]
+
+
+def mask_cpf(cpf: str) -> str:
+    """Mascara CPF deixando apenas os últimos 3 dígitos visíveis.
+
+    Args:
+        cpf: CPF normalizado (11 dígitos sem formatação).
+
+    Returns:
+        CPF mascarado no formato ***.***.*XX-YY.
+    """
+    digits = re.sub(r"\D", "", cpf)
+    if len(digits) != 11:
+        return "***.***.***-**"
+    return f"***.***.*{digits[8:10]}-{digits[10:]}"
+
+
+def mask_phone(phone: str) -> str:
+    """Mascara número de telefone, mantendo apenas o código do país.
+
+    Args:
+        phone: Número de telefone em qualquer formato.
+
+    Returns:
+        Número mascarado: +55-***-****-****
+    """
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) >= 2:
+        return f"+{digits[:2]}-***-****-****"
+    return "***-****-****"
+
+
+def mask_email(email: str) -> str:
+    """Mascara email preservando apenas o domínio.
+
+    Args:
+        email: Endereço de email completo.
+
+    Returns:
+        Email mascarado: ***@dominio.com
+    """
+    match = re.match(r"[^@]+@(.+)", email)
+    if match:
+        return f"***@{match.group(1)}"
+    return "***@***.***"
+
+
+def mask_bank_account(account: str) -> str:
+    """Mascara número de conta bancária, preservando últimos 4 dígitos.
+
+    Args:
+        account: Número de conta com ou sem dígito verificador.
+
+    Returns:
+        Conta mascarada: ****XXXX ou ****XXXX-Y
+    """
+    digits = re.sub(r"[-\s]", "", account)
+    if len(digits) > 4:
+        return f"****{digits[-4:]}"
+    return "****"
+
+
+def mask_all(text: str) -> str:
+    """Mascara todos os padrões de PII em um texto.
+
+    Args:
+        text: Texto original que pode conter PII.
+
+    Returns:
+        Texto com PII mascarado.
+    """
+    for pattern, replacement in _PII_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class PIIMaskingFilter(logging.Filter):
+    """Logging filter que mascara PII antes de gravar em qualquer handler.
+
+    Converte TODOS os args para string antes de mascarar para capturar PII
+    numérico (ex: número de conta passado como int).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = mask_all(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: mask_all(str(v)) for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(mask_all(str(a)) for a in record.args)
+        return True
+
+
+def setup_pii_logging() -> None:
+    """Aplica PIIMaskingFilter em todos os handlers do root logger.
+
+    Deve ser chamado APÓS setup_logging() — depende dos handlers já configurados.
+    """
+    pii_filter = PIIMaskingFilter()
+    for handler in logging.root.handlers:
+        handler.addFilter(pii_filter)

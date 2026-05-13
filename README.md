@@ -51,13 +51,67 @@ WhatsApp → API Gateway + WAF → Lambda Handler
 
 ```
 banqi-conversacional/
-├── README.md               ← este arquivo
-├── projeto.md              ← documentação completa do projeto
+├── README.md                   ← este arquivo
+├── projeto.md                  ← documentação completa do projeto
+├── Dockerfile                  ← imagem ARM64 para AgentCore Runtime
+├── pyproject.toml              ← dependências Python e configuração de ferramentas
+├── .env.example                ← variáveis de ambiente (copiar para .env)
 │
-├── api/                    ← contratos das APIs banQi
-├── specs/                  ← especificações técnicas e fluxo conversacional
-├── mock_api/               ← servidor mock para desenvolvimento e testes
-└── fluxo_trabalho/         ← PDFs com os diagramas de fluxo das etapas
+├── infrastructure/             ← E1: Infraestrutura AWS (Terraform)
+│   └── terraform/
+│       ├── main.tf             ← orquestra os 7 módulos
+│       ├── variables.tf        ← todas as variáveis de entrada
+│       ├── outputs.tf          ← outputs exportados
+│       ├── providers.tf        ← provider AWS + backend S3
+│       ├── terraform.tfvars.example
+│       └── modules/
+│           ├── network/        ← VPC, subnets, 7 VPC Endpoints, WAF
+│           ├── iam/            ← roles para Runtime, Lambda e Gateway
+│           ├── runtime/        ← AgentCore Runtime (container ARM64)
+│           ├── memory/         ← AgentCore Memory (STM + LTM)
+│           ├── gateway/        ← AgentCore Gateway MCP (8 targets banQi)
+│           ├── guardrails/     ← Bedrock Guardrails (prompt injection / jailbreak)
+│           └── whatsapp/       ← Lambda + API GW + DynamoDB dedup + WAF
+│
+├── domains/                    ← E2: Configuração de domínio
+│   └── consignado/
+│       ├── domain.yaml         ← config: agentes, modelos, memória, mensagens
+│       └── prompts/
+│           ├── supervisor.md   ← prompt do Supervisor (routing + delegação)
+│           ├── consignado.md   ← prompt do Consignado Agent (etapas 1-7)
+│           └── general.md      ← prompt do General Agent (fora do escopo)
+│
+├── src/                        ← E2/E3/E4: Código Python da aplicação
+│   ├── main.py                 ← entrypoint do AgentCore Runtime
+│   ├── agents/
+│   │   ├── factory.py          ← cria Supervisor + sub-agentes (Agents-as-Tools)
+│   │   └── context.py          ← SessionContext thread-local
+│   ├── tools/                  ← E3: 8 tools MCP (chamadas às APIs banQi)
+│   │   ├── consent_term.py     ← etapas 1-2: criar e aceitar termo
+│   │   ├── simulation.py       ← etapa 3: criar simulação e buscar fallback
+│   │   ├── proposal.py         ← etapas 4 e 6: criar proposta e aceite formal
+│   │   └── biometry.py         ← etapa 5: iniciar e continuar biometria
+│   ├── webhook/                ← E4: Handler de webhooks
+│   │   ├── handler.py          ← Lambda entrypoint (WhatsApp + banQi)
+│   │   ├── router.py           ← roteador de eventos banQi → handler
+│   │   ├── events.py           ← handlers para cada tipo de evento
+│   │   ├── session.py          ← correlação de sessão por telefone
+│   │   ├── models.py           ← modelos Pydantic dos payloads
+│   │   ├── signature.py        ← validação HMAC-SHA256 timing-safe
+│   │   ├── whatsapp_client.py  ← cliente HTTP WhatsApp Business API
+│   │   └── agentcore_client.py ← invoke AgentCore + save memory
+│   ├── config/
+│   │   └── settings.py         ← Settings (pydantic-settings, dual env/Secrets Manager)
+│   └── utils/
+│       ├── pii.py              ← PII masking nos logs (LGPD)
+│       ├── validation.py       ← validadores de CPF, e-mail, CEP etc.
+│       ├── logging.py          ← configuração de logging estruturado
+│       └── secrets.py          ← carregamento de secrets (dev: env / prod: Secrets Manager)
+│
+├── api/                        ← contratos OpenAPI das APIs banQi
+├── specs/                      ← especificações técnicas e fluxo conversacional
+├── mock_api/                   ← servidor mock para desenvolvimento e testes
+└── fluxo_trabalho/             ← PDFs com os diagramas de fluxo das etapas
 ```
 
 ---
@@ -299,6 +353,60 @@ PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, forn
 
 ---
 
+## Como Desenvolver
+
+### Pré-requisitos
+
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) (gerenciador de pacotes)
+- AWS CLI configurado com perfil `banqi-dev`
+- Terraform 1.7+
+
+### Setup local
+
+```powershell
+# 1. Instalar dependências
+uv pip install -e ".[dev]"
+
+# 2. Configurar variáveis de ambiente
+copy .env.example .env
+# editar .env com os valores do ambiente de dev
+
+# 3. Iniciar mock da API banQi (sem precisar do ambiente real)
+pip install -r mock_api/requirements.txt
+python -m uvicorn mock_api.server:app --port 8000 --reload
+
+# 4. Rodar testes do mock (40/40)
+python -X utf8 mock_api/test_flow.py
+```
+
+### Deploy da infraestrutura (E1)
+
+```powershell
+cd infrastructure/terraform
+
+# Inicializar (com backend S3 configurado)
+terraform init -backend-config=backend.tfvars
+
+# Planejar
+terraform plan -var-file=terraform.tfvars
+
+# Aplicar
+terraform apply -var-file=terraform.tfvars
+```
+
+### Build e deploy do container (E2)
+
+```powershell
+# Build local para teste
+docker build -t banqi-conversacional:local .
+
+# Build ARM64 para AgentCore (via CI/CD — ver .github/workflows/)
+docker buildx build --platform linux/arm64 -t banqi-conversacional:latest .
+```
+
+---
+
 ## Status Atual
 
 - [x] Especificação da arquitetura (`specs/spec.md`)
@@ -306,10 +414,10 @@ PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, forn
 - [x] Backlog detalhado — 105 tasks (`backlog.md`)
 - [x] Documentação completa do projeto (`projeto.md`)
 - [x] Mock API — 40/40 testes passando (`mock_api/`)
-- [ ] Infraestrutura AWS — E1
-- [ ] Implementação dos agentes — E2
-- [ ] Integração com APIs banQi — E3
-- [ ] Handler de webhooks — E4
+- [x] Infraestrutura AWS — E1 (Terraform: `infrastructure/terraform/`)
+- [x] Implementação dos agentes — E2 (`domains/consignado/` + `src/agents/` + `src/main.py`)
+- [x] Integração com APIs banQi — E3 (`src/tools/`: 8 tools MCP)
+- [x] Handler de webhooks — E4 (`src/webhook/`: Lambda handler + router + eventos)
 - [ ] Testes E2E e go-live — E5
 
 ---

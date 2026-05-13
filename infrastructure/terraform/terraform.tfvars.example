@@ -1,0 +1,33 @@
+# =============================================================================
+# terraform.tfvars.example — Copie para terraform.tfvars e preencha os valores
+# NUNCA versione o terraform.tfvars com secrets reais
+# =============================================================================
+
+# --- Core ---
+aws_region     = "us-east-1"
+environment    = "staging"
+aws_account_id = "123456789012"
+domain_slug    = "banqi-consignado"
+agent_name     = "banqi_consignado_agent"
+
+# --- Rede ---
+# "create" → provisiona VPC nova | "existing" → usa VPC existente por nome | "none" → sem VPC (PUBLIC)
+vpc_mode = "create"
+vpc_name = ""          # preencher apenas se vpc_mode = "existing"
+vpc_cidr = "10.0.0.0/16"
+
+# --- Container ---
+image_tag = "1.0.0"    # tag da imagem no ECR; "latest" em dev
+
+# --- Memória ---
+agentcore_memory_name = "BanqiConsignadoMemory"
+
+# --- API banQi ---
+banqi_api_base_url = "https://api.banqi.com.br/consignado/v1"
+
+# --- WhatsApp (preencher via variável de ambiente ou Secrets Manager em prod) ---
+# Em dev, export TF_VAR_whatsapp_token="..."
+whatsapp_token           = ""   # WhatsApp Cloud API access token
+whatsapp_app_secret      = ""   # App secret para verificação de assinatura
+whatsapp_verify_token    = ""   # Token de verificação do webhook
+whatsapp_phone_number_id = ""   # Phone Number ID do Meta Developer Portal

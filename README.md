@@ -207,31 +207,110 @@ PDFs com os diagramas de sequência das 7 etapas do fluxo de contratação, forn
 
 ---
 
+## Backlog Consolidado — Épicos e Histórias
+
+> Detalhamento completo com 105 tasks e dependências em [`backlog.md`](backlog.md)
+
+---
+
+### E1 — Infraestrutura e Setup AWS
+*Critério de aceite: Lambda recebe webhook do WhatsApp sem erro. AgentCore status ACTIVE.*
+
+| História | O que entrega | Tasks |
+|---|---|---|
+| H-01 Conta AWS e Networking | VPC privada, subnets em 2 AZs, 7 VPC Endpoints PrivateLink, Security Groups | T-01 a T-04 |
+| H-02 Repositório de Container | ECR com scan automático, Dockerfile ARM64, build via CodeBuild sem Docker local | T-05 a T-07 |
+| H-03 AgentCore Runtime | Runtime provisionado via Terraform, variáveis de ambiente, health check `/ping` validado | T-08 a T-10 |
+| H-04 AgentCore Memory | Memory store criado, namespace `users/{phone}/consignado` configurado, estratégias LTM ativas | T-11 a T-13 |
+| H-05 AgentCore Gateway | Cognito OAuth, 8 targets MCP apontando para APIs banQi, autenticação validada | T-14 a T-16 |
+| H-06 Lambda WhatsApp | Lambda + API Gateway + DynamoDB dedup (TTL 120s) + WAF (1.000 req/5min) + Meta webhook | T-17 a T-20 |
+| H-07 Bedrock Guardrails | Prompt attack detection HIGH, topic policy DENY fora do escopo consignado | T-21 a T-22 |
+| H-08 Secrets Manager | Secret JSON com credenciais WhatsApp, carregamento dual env var (dev) / Secrets Manager (prod) | T-23 a T-24 |
+
+---
+
+### E2 — Estrutura dos Agentes
+*Critério de aceite: Conversa básica funciona no Chainlit local. Routing correto em 10 mensagens de teste.*
+
+| História | O que entrega | Tasks |
+|---|---|---|
+| H-09 domain.yaml | Arquivo de configuração do domínio com agent_name, model IDs, prompts e namespaces de memória | T-25 a T-26 |
+| H-10 Supervisor Agent | Routing por intenção, recuperação LTM, injeção de contexto completo na delegação, retomada por `current_step` | T-27 a T-30 |
+| H-11 Consignado Agent | Controle de etapas (1–7), coleta progressiva (1 campo/mensagem), validações, mascaramento PII no chat | T-31 a T-34 |
+| H-12 General Agent | Mensagem padrão de fora do escopo, log de intenção para análise futura | T-35 |
+| H-13 Prompts | `supervisor.md` com routing e delegação, `consignado.md` com tom, etapas e tratamento de erros | T-36 a T-37 |
+| H-14 Memória e Persistência | STM sliding window, LTM tools `memory_read/write`, `save_conversation_to_memory()` no Lambda | T-38 a T-40 |
+
+---
+
+### E3 — Integração com APIs banQi (Tools MCP)
+*Critério de aceite: Cada tool retorna resposta esperada contra sandbox banQi.*
+
+| História | O que entrega | Tasks |
+|---|---|---|
+| H-15 create_consent_term | POST /consent-term, trata 406/409, aguarda webhook `CONSENT_TERM_FILE_READY` e envia PDF | T-41 a T-44 |
+| H-16 accept_consent_term | POST /consent-term/accept, captura IP/user-agent automático, roteia `SIMULATION_READY` ou `NO_OFFER_AVAILABLE` | T-45 a T-47 |
+| H-17 create_simulation | POST /simulations, cache hit (200 imediato) vs cache miss (202 + webhook), trata TOKEN_EXPIRED | T-48 a T-51 |
+| H-18 get_simulations | GET /simulations como fallback quando webhook `SIMULATION_COMPLETED` é perdido | T-52 |
+| H-19 create_proposal | POST /proposals, monta payload completo, aguarda `PROPOSAL_CREATED`, trata 412/422 | T-53 a T-56 |
+| H-20 start_biometry | POST /biometry, formata e envia BioLink ao cliente via WhatsApp | T-57 a T-58 |
+| H-21 continue_biometry | POST /biometry/continue, trata APPROVED/BIOMETRICS/DENIED, retry automático em BIOMETRICS | T-59 a T-61 |
+| H-22 accept_proposal | POST /accept com headers extras `x-remote-address` e `user-agent` | T-62 a T-63 |
+
+---
+
+### E4 — Handler de Webhooks
+*Critério de aceite: Todos os 6 tipos de evento processados corretamente em testes de integração.*
+
+| História | O que entrega | Tasks |
+|---|---|---|
+| H-23 Roteamento de Eventos | Switch por tipo de evento: handlers para `CONSENT_TERM_FILE_READY`, `NO_OFFER_AVAILABLE`, `SIMULATION_READY`, `SIMULATION_COMPLETED`, `PROPOSAL_CREATED`, `PROPOSAL_STATUS_UPDATE` | T-64 a T-70 |
+| H-24 Correlação de Sessão | Lookup de sessão ativa por `phone`, log auditável de eventos órfãos com PII mascarado | T-71 a T-72 |
+| H-25 Sessão Expirada | HTTP 200 para webhooks sem sessão (evita retry desnecessário), fila de eventos pendentes para reconexão | T-73 a T-74 |
+| H-26 Retry e DLQ | SQS DLQ, 3 tentativas com backoff exponencial, alarme CloudWatch para DLQ acumulando | T-75 a T-77 |
+
+---
+
+### E5 — Qualidade e Produção
+*Critério de aceite: P95 < 5s. Zero PII em logs. Pipeline CI/CD automático.*
+
+| História | O que entrega | Tasks |
+|---|---|---|
+| H-27 Testes Unitários | CPF, campos, PII masking, routing (10 in-scope + 10 out-of-scope), retomada por current_step | T-78 a T-82 |
+| H-28 Testes de Integração | 8 tools contra sandbox (happy path + erro), pipeline de webhook E2E | T-83 a T-85 |
+| H-29 Testes End-to-End | 7 cenários: fluxo completo, retomada, ELIGIBILITY_REJECTED, DENIED, TOKEN_EXPIRED, deduplicação, WhatsApp real | T-86 a T-92 |
+| H-30 CI/CD | GitHub Actions (pytest + ruff + Trivy), pipeline de deploy staging (build ARM64 → ECR → agentcore launch) | T-93 a T-95 |
+| H-31 Monitoramento | Dashboard CloudWatch (latência P95, erros, conversas, conversão), alarmes com SNS | T-96 a T-97 |
+| H-32 Carga e Segurança | 1.000 conversas simultâneas (Locust), prompt injection, jailbreak, fuzz, auditoria PII em logs | T-98 a T-102 |
+| H-33 Documentação | Runbook operacional, script LGPD `delete_user_data.py`, handover para o time banQi | T-103 a T-105 |
+
+---
+
 ## Roadmap
 
-| Fase | Escopo | Prazo |
+| Épico | Tasks | Prazo |
 |---|---|---|
-| 0 — Infraestrutura AWS | VPC, ECR, AgentCore, Lambda, Guardrails | 1 semana |
-| 1 — Agentes | Supervisor, Consignado Agent, prompts, memória LTM | 1 semana |
-| 2 — Tools / APIs | 8 tools MCP mapeando os endpoints banQi | 2 semanas |
-| 3 — Webhooks | Handler dos 6 eventos assíncronos | 1 semana |
-| 4 — End-to-End | Testes completos + WhatsApp real | 1 semana |
-| 5 — Qualidade | CI/CD, carga, segurança, LGPD, documentação | 2 semanas |
-| **Total** | **41 tasks** | **~8 semanas** |
+| E1 — Infraestrutura AWS | T-01 a T-24 | 1 semana |
+| E2 — Agentes | T-25 a T-40 | 1 semana |
+| E3 — Tools / APIs banQi | T-41 a T-63 | 2 semanas |
+| E4 — Webhooks | T-64 a T-77 | 1 semana |
+| E5 — Qualidade e Produção | T-78 a T-105 | 2 semanas |
+| **Total** | **105 tasks** | **~8 semanas** |
 
 ---
 
 ## Status Atual
 
-- [x] Especificação da arquitetura (`spec.md`)
-- [x] Fluxo conversacional (`po-brief.md`)
-- [x] Backlog de tasks (`tasks.md`)
-- [x] Mock API — 40/40 testes passando
-- [x] Documentação do projeto (`projeto.md`)
-- [ ] Infraestrutura AWS (Terraform)
-- [ ] Implementação dos agentes
-- [ ] Integração com APIs banQi
-- [ ] Testes E2E em staging
+- [x] Especificação da arquitetura (`specs/spec.md`)
+- [x] Fluxo conversacional turno a turno (`specs/pipeline/po-brief.md`)
+- [x] Backlog detalhado — 105 tasks (`backlog.md`)
+- [x] Documentação completa do projeto (`projeto.md`)
+- [x] Mock API — 40/40 testes passando (`mock_api/`)
+- [ ] Infraestrutura AWS — E1
+- [ ] Implementação dos agentes — E2
+- [ ] Integração com APIs banQi — E3
+- [ ] Handler de webhooks — E4
+- [ ] Testes E2E e go-live — E5
 
 ---
 

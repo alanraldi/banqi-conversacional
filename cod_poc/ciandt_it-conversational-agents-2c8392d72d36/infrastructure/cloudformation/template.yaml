@@ -1,0 +1,383 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  BedrockAgentCore infrastructure — Runtime, Memory, Gateway, ECR, DynamoDB dedup, IAM (least-privilege)
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  DomainSlug:
+    Type: String
+    Description: Domain identifier slug (e.g. my-assistant)
+    AllowedPattern: ^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$
+
+  AgentName:
+    Type: String
+    Description: Agent runtime name
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]{0,99}$
+
+  MemoryName:
+    Type: String
+    Description: AgentCore Memory name
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]{0,47}$
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Bedrock model ID used by the agent
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # ECR Repository
+  # -------------------------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${DomainSlug}-${Environment}-agent'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref DomainSlug
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # -------------------------------------------------------------------------
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/agentcore/${DomainSlug}-${Environment}/${AgentName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref DomainSlug
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # DynamoDB — dedup table with TTL
+  # -------------------------------------------------------------------------
+  DedupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${DomainSlug}-${Environment}-dedup'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref DomainSlug
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # IAM — Runtime Execution Role
+  # -------------------------------------------------------------------------
+  RuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainSlug}-${Environment}-runtime-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref DomainSlug
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RuntimeExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${DomainSlug}-${Environment}-runtime-policy'
+      Roles:
+        - !Ref RuntimeExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}'
+          - Sid: ECRPull
+            Effect: Allow
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+            Resource:
+              - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${DomainSlug}-${Environment}-agent'
+          - Sid: ECRAuth
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource:
+              - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${DomainSlug}-${Environment}-agent'
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/agentcore/${DomainSlug}-${Environment}/${AgentName}:*'
+
+  # -------------------------------------------------------------------------
+  # IAM — Memory Execution Role
+  # -------------------------------------------------------------------------
+  MemoryExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainSlug}-${Environment}-memory-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref DomainSlug
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MemoryExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${DomainSlug}-${Environment}-memory-policy'
+      Roles:
+        - !Ref MemoryExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvokeForMemory
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+            Resource:
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}'
+
+  # -------------------------------------------------------------------------
+  # IAM — Gateway Service Role
+  # -------------------------------------------------------------------------
+  GatewayServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainSlug}-${Environment}-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref DomainSlug
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  GatewayServicePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${DomainSlug}-${Environment}-gateway-policy'
+      Roles:
+        - !Ref GatewayServiceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InvokeTargets
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DomainSlug}-${Environment}-*'
+
+  # -------------------------------------------------------------------------
+  # AgentCore Runtime
+  # -------------------------------------------------------------------------
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: RuntimeExecutionPolicy
+    Properties:
+      AgentRuntimeName: !Sub '${AgentName}'
+      Description: !Sub '${DomainSlug} agent runtime (${Environment})'
+      RoleArn: !GetAtt RuntimeExecutionRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DomainSlug}-${Environment}-agent:latest'
+      EnvironmentVariables:
+        APP_ENV: !Ref Environment
+        AWS_REGION: !Ref AWS::Region
+        MODEL_ID: !Ref ModelId
+      Tags:
+        Project: !Ref DomainSlug
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # AgentCore Runtime Endpoint
+  # -------------------------------------------------------------------------
+  AgentRuntimeEndpoint:
+    Type: AWS::BedrockAgentCore::RuntimeEndpoint
+    Properties:
+      AgentRuntimeId: !GetAtt AgentRuntime.AgentRuntimeId
+      Name: !Sub '${DomainSlug}-${Environment}-endpoint'
+      Description: !Sub 'Endpoint for ${AgentName} (${Environment})'
+      Tags:
+        Project: !Ref DomainSlug
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # AgentCore Memory
+  # -------------------------------------------------------------------------
+  AgentMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    DependsOn: MemoryExecutionPolicy
+    Properties:
+      MemoryName: !Ref MemoryName
+      Description: !Sub 'Long-term memory for ${DomainSlug} (${Environment})'
+      MemoryExecutionRoleArn: !GetAtt MemoryExecutionRole.Arn
+      EventExpiryDuration: 90
+      Strategies:
+        - SemanticMemoryStrategy:
+            Name: facts
+            Namespaces:
+              - /facts/{actorId}/
+        - UserPreferenceMemoryStrategy:
+            Name: preferences
+            Namespaces:
+              - /users/{actorId}/preferences/
+        - SummaryMemoryStrategy:
+            Name: summaries
+            Namespaces:
+              - /summaries/{actorId}/{sessionId}/
+      Tags:
+        Project: !Ref DomainSlug
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # AgentCore Gateway
+  # -------------------------------------------------------------------------
+  AgentGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DependsOn: GatewayServicePolicy
+    Properties:
+      Name: !Sub '${DomainSlug}-${Environment}-gateway'
+      Description: !Sub 'MCP Gateway for ${DomainSlug} (${Environment})'
+      RoleArn: !GetAtt GatewayServiceRole.Arn
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      Tags:
+        Project: !Ref DomainSlug
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # AgentCore Gateway Target (placeholder — Lambda target)
+  # -------------------------------------------------------------------------
+  AgentGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentGateway.GatewayId
+      Name: !Sub '${DomainSlug}-${Environment}-tools'
+      Description: !Sub 'Tool target for ${DomainSlug} gateway'
+      TargetConfiguration:
+        LambdaTargetConfiguration:
+          LambdaArn: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DomainSlug}-${Environment}-tools'
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  RuntimeArn:
+    Description: AgentCore Runtime ARN
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+    Export:
+      Name: !Sub '${DomainSlug}-${Environment}-RuntimeArn'
+
+  RuntimeEndpointId:
+    Description: AgentCore Runtime Endpoint ID
+    Value: !GetAtt AgentRuntimeEndpoint.AgentRuntimeEndpointId
+
+  MemoryId:
+    Description: AgentCore Memory ID
+    Value: !GetAtt AgentMemory.MemoryId
+    Export:
+      Name: !Sub '${DomainSlug}-${Environment}-MemoryId'
+
+  GatewayArn:
+    Description: AgentCore Gateway ARN
+    Value: !GetAtt AgentGateway.GatewayArn
+    Export:
+      Name: !Sub '${DomainSlug}-${Environment}-GatewayArn'
+
+  EcrUri:
+    Description: ECR Repository URI
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: !Sub '${DomainSlug}-${Environment}-EcrUri'
+
+  DedupTableName:
+    Description: DynamoDB dedup table name
+    Value: !Ref DedupTable
+
+  LogGroupName:
+    Description: CloudWatch Log Group
+    Value: !Ref AgentLogGroup

@@ -1,0 +1,103 @@
+image: python:3.12-slim
+
+definitions:
+  caches:
+    uv: ~/.cache/uv
+  services:
+    dynamodb:
+      image: amazon/dynamodb-local:latest
+      memory: 512
+
+  steps:
+    - step: &unit-tests
+        name: "Level 1 — Unit Tests"
+        caches:
+          - uv
+        script:
+          - pip install uv
+          - uv sync --dev
+          - uv run pytest tests/unit/ -v -m "not container and not staging"
+              --cov=src --cov-report=term-missing --cov-fail-under=80
+          - uv run pytest -v -m critical --tb=short
+
+    - step: &iac-validation
+        name: "Level 1 — IaC Validation"
+        caches:
+          - uv
+        script:
+          - pip install uv
+          - uv sync --dev
+          - uv run pytest tests/unit/infra/ -v
+          - "! grep -r 'Resource.*\"\\*\"' infrastructure/ --include='*.yaml' --include='*.tf' || { echo 'FAIL: IAM wildcard'; exit 1; }"
+          - pip install detect-secrets
+          - detect-secrets scan --baseline .secrets.baseline
+
+    - step: &container-tests
+        name: "Level 2 — Container Tests"
+        services:
+          - docker
+        caches:
+          - docker
+        script:
+          - docker build -t conversational-agent:test .
+          - docker run -d --name agent -p 8080:8080
+              -e SUPERVISOR_AGENT_MODEL_ID=mock
+              -e AGENTCORE_MEMORY_ID=mock
+              conversational-agent:test
+          - sleep 10
+          - bash tests/container/test_health.sh
+          - docker stop agent && docker rm agent
+
+    - step: &staging-deploy-test
+        name: "Level 3 — Staging E2E"
+        deployment: staging
+        script:
+          - pip install uv
+          - uv sync --dev
+          - cd infrastructure/terraform
+          - terraform init
+          - terraform apply -auto-approve -var="environment=staging"
+          - cd ../..
+          - uv run pytest tests/e2e/ -v -m staging --staging-url=$STAGING_URL
+        after-script:
+          - cd infrastructure/terraform
+          - terraform destroy -auto-approve -var="environment=staging"
+
+pipelines:
+  default:
+    - step: *unit-tests
+    - step: *iac-validation
+
+  pull-requests:
+    '**':
+      - step: *unit-tests
+      - step: *iac-validation
+      - step: *container-tests
+
+  branches:
+    main:
+      - step: *unit-tests
+      - step: *iac-validation
+      - step: *container-tests
+      - step: *staging-deploy-test
+
+  custom:
+    security-scan:
+      - step:
+          name: "Weekly Security Scan"
+          script:
+            - pip install uv
+            - uv sync --dev
+            - uv run pip-audit --strict --desc
+            - docker build -t conversational-agent:scan .
+            - pip install trivy
+            - trivy image --severity CRITICAL,HIGH --exit-code 1
+                --ignorefile .trivyignore conversational-agent:scan
+          services:
+            - docker
+
+  schedules:
+    - cron: "0 9 * * 1"
+      pipeline:
+        custom:
+          security-scan

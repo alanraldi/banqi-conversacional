@@ -1,0 +1,3 @@
+# Trivy ignore — documented false positives only
+# Add CVE IDs here with justification comments
+# Example: CVE-2024-XXXXX  # false positive: not reachable in our code path

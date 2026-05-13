@@ -1,0 +1,29 @@
+# =============================================================================
+# Required
+# =============================================================================
+domain_slug    = "my-assistant"
+agent_name     = "my_multi_agent"
+environment    = "dev"
+aws_account_id = "123456789012"
+aws_region     = "us-east-1"
+memory_name    = "MyAssistantMemory"
+
+# =============================================================================
+# Knowledge Base (enabled by default)
+# =============================================================================
+# knowledge_base_enabled = true
+# embedding_model_id     = "amazon.titan-embed-text-v2:0"
+# chunking_strategy      = "FIXED_SIZE"
+
+# =============================================================================
+# WhatsApp Channel (enabled by default — secrets required)
+# =============================================================================
+whatsapp_token           = ""  # WhatsApp Business API access token
+whatsapp_app_secret      = ""  # App secret for HMAC signature validation
+whatsapp_verify_token    = ""  # Webhook verification token
+whatsapp_phone_number_id = ""  # WhatsApp Business Phone Number ID
+
+# Tip: use TF_VAR_ env vars for secrets instead of this file:
+#   export TF_VAR_whatsapp_token="your-token"
+#   export TF_VAR_whatsapp_app_secret="your-secret"
+#   export TF_VAR_whatsapp_verify_token="your-verify-token"

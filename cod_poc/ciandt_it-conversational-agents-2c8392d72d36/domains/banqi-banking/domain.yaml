@@ -1,0 +1,63 @@
+domain:
+  name: "BanQi"
+  slug: "banqi-banking"
+  description: "Assistente bancário conversacional"
+  language_default: "pt-BR"
+
+agent:
+  name: "banqi_multi_agent"
+  memory_name: "BanQiMemory"
+  session_prefix: "session"
+
+supervisor:
+  prompt_file: "prompts/supervisor.md"
+  description: "Coordenador principal que analisa intenção e roteia para agentes especializados"
+  model_id_env: "SUPERVISOR_AGENT_MODEL_ID"
+
+sub_agents:
+  services:
+    name: "Services Agent"
+    description: "Operações bancárias (saldo, transações, empréstimos)"
+    prompt_file: "prompts/services.md"
+    tool_docstring: "Processa consultas bancárias: saldo, transações, empréstimos"
+    model_id_env: "SERVICES_AGENT_MODEL_ID"
+    tools_source: "gateway_mcp"
+  knowledge:
+    name: "Knowledge Agent"
+    description: "Informações sobre produtos e serviços"
+    prompt_file: "prompts/knowledge.md"
+    tool_docstring: "Consultas gerais sobre produtos e serviços"
+    model_id_env: "KNOWLEDGE_AGENT_MODEL_ID"
+    tools_source: "bedrock_kb"
+
+memory:
+  namespaces:
+    users/{user_id}/preferences:
+      top_k: 3
+      relevance_score: 0.7
+    users/{user_id}/facts:
+      top_k: 7
+      relevance_score: 0.4
+    summaries/{user_id}/{session_id}:
+      top_k: 3
+      relevance_score: 0.4
+
+channels:
+  whatsapp:
+    enabled: true
+    type: webhook
+  chainlit:
+    enabled: true
+    type: local
+
+interface:
+  welcome_message: |
+    🏦 Olá! Sou o assistente BanQi.
+    • Consultar saldo
+    • Ver transações
+    • Informações sobre empréstimos
+  author_name: "BanQi Assistant"
+
+error_messages:
+  generic: "Desculpe, ocorreu um erro. Tente novamente em alguns instantes."
+  empty_input: "Envie sua pergunta ou solicitação."

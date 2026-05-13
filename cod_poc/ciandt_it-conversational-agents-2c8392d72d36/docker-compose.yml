@@ -1,0 +1,35 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DOMAIN_DIR=${DOMAIN_DIR:-domains/banqi-banking}
+      - SUPERVISOR_AGENT_MODEL_ID=${SUPERVISOR_AGENT_MODEL_ID:-us.anthropic.claude-sonnet-4-6}
+      - SERVICES_AGENT_MODEL_ID=${SERVICES_AGENT_MODEL_ID:-us.anthropic.claude-sonnet-4-6}
+      - KNOWLEDGE_AGENT_MODEL_ID=${KNOWLEDGE_AGENT_MODEL_ID:-us.anthropic.claude-sonnet-4-6}
+      - AGENTCORE_MEMORY_ID=${AGENTCORE_MEMORY_ID:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    ports:
+      - "8000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3

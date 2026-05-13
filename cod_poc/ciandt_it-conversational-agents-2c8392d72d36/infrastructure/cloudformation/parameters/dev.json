@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "DomainSlug",   "ParameterValue": "banqi-banking" },
+  { "ParameterKey": "AgentName",    "ParameterValue": "banqi_multi_agent" },
+  { "ParameterKey": "MemoryName",   "ParameterValue": "BanQiMemory" },
+  { "ParameterKey": "Environment",  "ParameterValue": "dev" },
+  { "ParameterKey": "ModelId",      "ParameterValue": "us.anthropic.claude-sonnet-4-6" }
+]

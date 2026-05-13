@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: WhatsApp webhook Lambda + API Gateway + DynamoDB dedup (domain-agnostic)
+
+Parameters:
+  AgentName:
+    Type: String
+    Description: AgentCore agent name/ARN for invocation
+
+  WhatsAppToken:
+    Type: String
+    NoEcho: true
+    Description: WhatsApp Business API access token
+
+  WhatsAppAppSecret:
+    Type: String
+    NoEcho: true
+    Description: WhatsApp app secret for signature validation
+
+  WhatsAppVerifyToken:
+    Type: String
+    NoEcho: true
+    Description: WhatsApp webhook verify token
+
+  WhatsAppPhoneNumberId:
+    Type: String
+    Description: WhatsApp Business Phone Number ID
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+
+  ErrorMessageGeneric:
+    Type: String
+    Default: "Sorry, an error occurred. Please try again."
+    Description: Generic error message sent to users
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.12
+    Architectures:
+      - arm64
+
+Resources:
+  MessageDedupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AgentName}-dedup-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  WhatsAppWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AgentName}-whatsapp-${Environment}'
+      CodeUri: ../../src/channels/whatsapp/
+      Handler: lambda_handler.lambda_handler
+      Description: WhatsApp webhook processor
+      Environment:
+        Variables:
+          WHATSAPP_ACCESS_TOKEN: !Ref WhatsAppToken
+          WHATSAPP_APP_SECRET: !Ref WhatsAppAppSecret
+          WHATSAPP_VERIFY_TOKEN: !Ref WhatsAppVerifyToken
+          WHATSAPP_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+          AGENTCORE_AGENT_NAME: !Ref AgentName
+          DEDUP_TABLE_NAME: !Ref MessageDedupTable
+          ERROR_MESSAGE_GENERIC: !Ref ErrorMessageGeneric
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: DynamoDBDedup
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt MessageDedupTable.Arn
+            - Sid: AgentCoreInvoke
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:InvokeAgentRuntime
+              Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentName}'
+            - Sid: CloudWatchLogs
+              Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AgentName}-whatsapp-${Environment}:*'
+      Events:
+        WebhookGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WhatsAppApi
+            Path: /webhook
+            Method: GET
+        WebhookPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WhatsAppApi
+            Path: /webhook
+            Method: POST
+
+  WhatsAppApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${AgentName}-whatsapp-api-${Environment}'
+      StageName: !Ref Environment
+
+Outputs:
+  WebhookUrl:
+    Description: WhatsApp Webhook URL (configure in Meta Developer Console)
+    Value: !Sub 'https://${WhatsAppApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook'
+
+  FunctionName:
+    Value: !Ref WhatsAppWebhookFunction
+
+  DedupTableName:
+    Value: !Ref MessageDedupTable

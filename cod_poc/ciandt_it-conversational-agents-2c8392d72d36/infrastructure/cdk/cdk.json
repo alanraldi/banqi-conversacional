@@ -1,0 +1,16 @@
+{
+  "app": "python3 app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["cdk.out", "**/__pycache__", "*.pyc", ".venv"]
+  },
+  "context": {
+    "domain_slug": "banqi-banking",
+    "agent_name": "banqi_multi_agent",
+    "environment": "dev",
+    "memory_name": "BanQiMemory",
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:stackRelativeExports": true
+  }
+}
